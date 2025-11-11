@@ -37,8 +37,71 @@ const viewingCapabilities = {
 	}
 };
 
+// Reverse geocode coordinates to get location name
+async function getLocationName(latitude, longitude) {
+	const apiUrl = `https://nominatim.openstreetmap.org/reverse?` +
+		`lat=${latitude}&lon=${longitude}&format=json`;
+
+	console.log(`[Geocoding] Looking up location for lat=${latitude}, lon=${longitude}`);
+
+	try {
+		const parsedUrl = url.parse(apiUrl);
+
+		return new Promise((resolve, reject) => {
+			https.get({
+				hostname: parsedUrl.hostname,
+				path: parsedUrl.path,
+				method: 'GET',
+				headers: {
+					'User-Agent': 'AstronomyBuddy/1.0'
+				}
+			}, (res) => {
+				let data = '';
+
+				res.on('data', (chunk) => {
+					data += chunk;
+				});
+
+				res.on('end', () => {
+					if (res.statusCode === 200) {
+						const result = JSON.parse(data);
+						const address = result.address;
+
+						// Try to build a "City, State" or "City, Country" format
+						let locationName = '';
+
+						if (address.city) {
+							locationName = address.city;
+						} else if (address.town) {
+							locationName = address.town;
+						} else if (address.village) {
+							locationName = address.village;
+						} else if (address.county) {
+							locationName = address.county;
+						}
+
+						console.log(`[Geocoding] Location: ${locationName || 'Unknown'}`);
+						resolve(locationName || 'Unknown Location');
+					} else {
+						console.error(`[Geocoding] Request failed with status ${res.statusCode}`);
+						resolve('Unknown Location');
+					}
+				});
+			}).on('error', (err) => {
+				console.error('[Geocoding] Request error:', err.message);
+				resolve('Unknown Location');
+			});
+		});
+	} catch (error) {
+		console.error('[Geocoding] Exception:', error.message);
+		return 'Unknown Location';
+	}
+}
+
 // Weather condition interpretation from 7timer
 function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
+	console.log(`[Weather] Interpreting conditions for hours ${eveningStartHour}-${eveningEndHour}`);
+
 	const eveningData = data.dataseries.filter(point => {
 		const hour = (point.timepoint % 24);
 		if (eveningEndHour > eveningStartHour) {
@@ -48,7 +111,10 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
 		}
 	});
 
+	console.log(`[Weather] Found ${eveningData.length} data points for evening hours`);
+
 	if (eveningData.length === 0) {
+		console.log('[Weather] No evening data available');
 		return null;
 	}
 
@@ -102,6 +168,8 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
 
 	const worthObserving = quality !== 'unsuitable' && quality !== 'poor' && avgCloudCover < 6;
 
+	console.log(`[Weather] Quality: ${quality}, Cloud cover: ${avgCloudCover.toFixed(1)}, Seeing: ${avgSeeing.toFixed(1)}, Transparency: ${avgTransparency.toFixed(1)}`);
+
 	return {
 		quality,
 		score,
@@ -118,6 +186,8 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
 async function getWeatherConditions(latitude, longitude) {
 	const apiUrl = `https://www.7timer.info/bin/astro.php?` +
 		`lon=${longitude}&lat=${latitude}&ac=0&lang=en&unit=imperial&output=json&tzshift=0`;
+
+	console.log(`[Weather API] Fetching data for lat=${latitude}, lon=${longitude}`);
 
 	try {
 		const parsedUrl = url.parse(apiUrl);
@@ -136,16 +206,20 @@ async function getWeatherConditions(latitude, longitude) {
 
 				res.on('end', () => {
 					if (res.statusCode === 200) {
+						console.log('[Weather API] Successfully retrieved weather data');
 						resolve(JSON.parse(data));
 					} else {
+						console.error(`[Weather API] Request failed with status ${res.statusCode}`);
 						reject(new Error(`Weather API request failed with status ${res.statusCode}`));
 					}
 				});
 			}).on('error', (err) => {
+				console.error('[Weather API] Request error:', err.message);
 				reject(err);
 			});
 		});
 	} catch (error) {
+		console.error('[Weather API] Exception:', error.message);
 		throw new Error(`Failed to fetch weather data: ${error.message}`);
 	}
 }
@@ -212,10 +286,12 @@ function makeRequest(urlString) {
 				if (res.statusCode === 200) {
 					resolve(JSON.parse(data));
 				} else {
+					console.error(`[Astronomy API] Request failed with status ${res.statusCode}`);
 					reject(new Error(`API request failed with status ${res.statusCode}: ${data}`));
 				}
 			});
 		}).on('error', (err) => {
+			console.error('[Astronomy API] Request error:', err.message);
 			reject(err);
 		});
 	});
@@ -237,6 +313,8 @@ async function analyzeTargets(date, time, latitude, longitude, elevation, viewin
 	const apiUrl = `https://api.astronomyapi.com/api/v2/bodies/positions?` +
 		`latitude=${latitude}&longitude=${longitude}&elevation=${elevation}` +
 		`&from_date=${date}&to_date=${date}&time=${time}`;
+
+	console.log(`[Astronomy API] Fetching positions for ${time}`);
 
 	try {
 		const response = await makeRequest(apiUrl);
@@ -263,8 +341,10 @@ async function analyzeTargets(date, time, latitude, longitude, elevation, viewin
 			});
 		}
 
+		console.log(`[Astronomy API] Found ${results.length} celestial bodies for ${time}`);
 		return results;
 	} catch (error) {
+		console.error(`[Astronomy API] Failed to fetch data for ${time}:`, error.message);
 		throw new Error(`Failed to fetch data for ${time}: ${error.message}`);
 	}
 }
@@ -301,12 +381,21 @@ function getDirection(azimuth) {
 
 // Main function to get viewing data
 async function getViewingData(latitude, longitude, elevation, viewingLevel, eveningStartHour, eveningEndHour) {
+	console.log(`[Main] Starting analysis for lat=${latitude}, lon=${longitude}, elevation=${elevation}, level=${viewingLevel}`);
+	console.log(`[Main] Evening hours: ${eveningStartHour}:00 - ${eveningEndHour}:00`);
+
 	const viewingCaps = viewingCapabilities[viewingLevel];
 	const date = getCurrentDate();
+
+	console.log(`[Main] Date: ${date}`);
+
+	// Get location name
+	const locationName = await getLocationName(latitude, longitude);
 
 	const result = {
 		date,
 		location: {
+			name: locationName,
 			latitude,
 			longitude,
 			elevation
@@ -326,6 +415,7 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 		const weatherData = await getWeatherConditions(latitude, longitude);
 		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour);
 	} catch (error) {
+		console.error('[Main] Weather data error:', error.message);
 		result.weather = {
 			error: 'Weather data unavailable',
 			message: error.message
@@ -341,6 +431,8 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 		if (currentHour === (eveningEndHour + 1) % 24) break;
 		if (hours.length > 12) break;
 	}
+
+	console.log(`[Main] Analyzing ${hours.length} hours: ${hours.join(', ')}`);
 
 	// Collect data for all hours
 	const targetsByName = new Map();
@@ -371,9 +463,11 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 				});
 			}
 		} catch (error) {
-			console.error(`Error fetching data for ${time}: ${error.message}`);
+			console.error(`[Main] Error fetching data for ${time}:`, error.message);
 		}
 	}
+
+	console.log(`[Main] Tracked ${targetsByName.size} unique celestial bodies`);
 
 	// Analyze and display results
 	const nightSummary = [];
@@ -424,12 +518,18 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 	result.targets.good = nightSummary.filter(t => t.bestRating === 'good');
 	result.targets.fair = nightSummary.filter(t => t.bestRating === 'fair');
 
+	console.log(`[Main] Results: ${result.targets.excellent.length} excellent, ${result.targets.good.length} good, ${result.targets.fair.length} fair targets`);
+
 	return result;
 }
 
 // Create HTTP server
+// Create HTTP server
 const server = http.createServer(async (req, res) => {
 	const parsedUrl = url.parse(req.url, true);
+
+	// Log incoming request
+	console.log(`[Request] ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
 
 	// Set CORS headers
 	res.setHeader('Access-Control-Allow-Origin', '*');
@@ -455,6 +555,7 @@ const server = http.createServer(async (req, res) => {
 		try {
 			// Validate API configuration
 			if (!config.appId || !config.appSecret) {
+				console.error('[Config] Missing API credentials');
 				res.writeHead(500, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Configuration error',
@@ -464,15 +565,42 @@ const server = http.createServer(async (req, res) => {
 			}
 
 			// Parse query parameters
-			const query = parsedUrl.query;
+			let query = parsedUrl.query;
+
+			console.log('[Request] Raw query parameters:', JSON.stringify(query));
+
+			// Check if parameters are sent as JSON object in URL
+			// This happens when the query string looks like: ?{"latitude": 47.6694,...}
+			const queryKeys = Object.keys(query);
+			if (queryKeys.length === 1 && queryKeys[0].startsWith('{')) {
+				try {
+					// The entire JSON object is the key, decode and parse it
+					const jsonString = decodeURIComponent(queryKeys[0]);
+					query = JSON.parse(jsonString);
+					console.log('[Request] Detected JSON-encoded parameters, parsed successfully');
+				} catch (e) {
+					console.error('[Request] Failed to parse JSON-encoded parameters:', e.message);
+					res.writeHead(400, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify({
+						error: 'Invalid parameters',
+						message: 'Failed to parse JSON-encoded query parameters'
+					}));
+					return;
+				}
+			}
+
+			console.log('[Request] Query parameters:', JSON.stringify(query));
 
 			// Required parameters
 			const latitude = parseFloat(query.latitude);
 			const longitude = parseFloat(query.longitude);
 			const elevation = parseFloat(query.elevation);
 
+			console.log(`[Request] Parsed coordinates: lat=${latitude}, lon=${longitude}, elevation=${elevation}`);
+
 			// Validate required parameters
 			if (isNaN(latitude) || isNaN(longitude) || isNaN(elevation)) {
+				console.error('[Request] Invalid or missing required parameters');
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid parameters',
@@ -484,6 +612,7 @@ const server = http.createServer(async (req, res) => {
 
 			// Validate latitude range
 			if (latitude < -90 || latitude > 90) {
+				console.error(`[Request] Latitude out of range: ${latitude}`);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid latitude',
@@ -494,6 +623,7 @@ const server = http.createServer(async (req, res) => {
 
 			// Validate longitude range
 			if (longitude < -180 || longitude > 180) {
+				console.error(`[Request] Longitude out of range: ${longitude}`);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid longitude',
@@ -503,12 +633,31 @@ const server = http.createServer(async (req, res) => {
 			}
 
 			// Optional parameters with defaults
-			const viewingLevel = query.viewingLevel || config.viewingLevel;
-			const eveningStartHour = query.eveningStartHour ? parseInt(query.eveningStartHour) : config.eveningStartHour;
-			const eveningEndHour = query.eveningEndHour ? parseInt(query.eveningEndHour) : config.eveningEndHour;
+			// Handle viewing level mapping - check if it contains descriptions
+			let viewingLevel = query.viewingLevel || config.viewingLevel;
+
+			// Map descriptive viewing levels to simple keys
+			if (typeof viewingLevel === 'string') {
+				const lowerLevel = viewingLevel.toLowerCase();
+				if (lowerLevel.includes('entry') || lowerLevel.includes('60-80mm')) {
+					viewingLevel = 'entry';
+				} else if (lowerLevel.includes('intermediate') || lowerLevel.includes('100-150mm')) {
+					viewingLevel = 'intermediate';
+				} else if (lowerLevel.includes('advanced') || lowerLevel.includes('200mm')) {
+					viewingLevel = 'advanced';
+				} else if (lowerLevel.includes('naked')) {
+					viewingLevel = 'naked-eye';
+				}
+			}
+
+			const eveningStartHour = query.eveningStartHour ? parseInt(query.eveningStartHour, 10) : config.eveningStartHour;
+			const eveningEndHour = query.eveningEndHour ? parseInt(query.eveningEndHour, 10) : config.eveningEndHour;
+
+			console.log(`[Request] Viewing level: ${viewingLevel}, Hours: ${eveningStartHour}-${eveningEndHour}`);
 
 			// Validate viewing level
 			if (!viewingCapabilities[viewingLevel]) {
+				console.error(`[Request] Invalid viewing level: ${viewingLevel}`);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid viewing level',
@@ -519,6 +668,7 @@ const server = http.createServer(async (req, res) => {
 
 			// Validate hours
 			if (isNaN(eveningStartHour) || eveningStartHour < 0 || eveningStartHour > 23) {
+				console.error(`[Request] Invalid eveningStartHour: ${eveningStartHour}`);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid eveningStartHour',
@@ -528,6 +678,7 @@ const server = http.createServer(async (req, res) => {
 			}
 
 			if (isNaN(eveningEndHour) || eveningEndHour < 0 || eveningEndHour > 23) {
+				console.error(`[Request] Invalid eveningEndHour: ${eveningEndHour}`);
 				res.writeHead(400, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({
 					error: 'Invalid eveningEndHour',
@@ -536,11 +687,16 @@ const server = http.createServer(async (req, res) => {
 				return;
 			}
 
+			console.log('[Request] All validations passed, fetching viewing data...');
+
 			const data = await getViewingData(latitude, longitude, elevation, viewingLevel, eveningStartHour, eveningEndHour);
+
+			console.log('[Request] Successfully generated viewing data, sending response');
+
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify(data, null, 2));
 		} catch (error) {
-			console.error('Error processing request:', error);
+			console.error('[Request] Error processing request:', error);
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({
 				error: 'Internal server error',
@@ -551,6 +707,7 @@ const server = http.createServer(async (req, res) => {
 	}
 
 	// 404 for all other routes
+	console.log(`[Request] 404 - Route not found: ${parsedUrl.pathname}`);
 	res.writeHead(404, { 'Content-Type': 'application/json' });
 	res.end(JSON.stringify({
 		error: 'Not found',
@@ -560,16 +717,16 @@ const server = http.createServer(async (req, res) => {
 
 // Start server
 server.listen(config.port, () => {
-	console.log(`Astronomy Buddy API running on port ${config.port}`);
-	console.log(`Example: http://localhost:${config.port}/viewing-data?latitude=47.6062&longitude=-122.3321&elevation=50`);
-	console.log(`Health check: http://localhost:${config.port}/health`);
+	console.log(`[Server] Astronomy Buddy API running on port ${config.port}`);
+	console.log(`[Server] Example: http://localhost:${config.port}/viewing-data?latitude=47.6062&longitude=-122.3321&elevation=50`);
+	console.log(`[Server] Health check: http://localhost:${config.port}/health`);
 });
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
-	console.log('SIGTERM received, closing server...');
+	console.log('[Server] SIGTERM received, closing server...');
 	server.close(() => {
-		console.log('Server closed');
+		console.log('[Server] Server closed');
 		process.exit(0);
 	});
 });
