@@ -331,44 +331,61 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
 }
 
 // Get weather conditions from 7timer
-async function getWeatherConditions(latitude, longitude) {
+async function getWeatherConditions(latitude, longitude, retries = 2) {
 	const apiUrl = `https://www.7timer.info/bin/astro.php?` +
 		`lon=${longitude}&lat=${latitude}&ac=0&lang=en&unit=imperial&output=json&tzshift=0`;
 
-	console.log(`[Weather API] Fetching data for lat=${latitude}, lon=${longitude}`);
+	for (let attempt = 0; attempt <= retries; attempt++) {
+		try {
+			console.log(`[Weather API] Fetching data for lat=${latitude}, lon=${longitude} (attempt ${attempt + 1})`);
+			const parsedUrl = url.parse(apiUrl);
 
-	try {
-		const parsedUrl = url.parse(apiUrl);
+			const result = await new Promise((resolve, reject) => {
+				https.get({
+					hostname: parsedUrl.hostname,
+					path: parsedUrl.path,
+					method: 'GET'
+				}, (res) => {
+					let data = '';
+					res.on('data', (chunk) => {
+						data += chunk;
+					});
+					res.on('end', () => {
+						if (res.statusCode === 200) {
+							console.log('[Weather API] Successfully retrieved weather data');
+							console.log(`[Weather API] Response length: ${data.length} bytes`);
 
-		return new Promise((resolve, reject) => {
-			https.get({
-				hostname: parsedUrl.hostname,
-				path: parsedUrl.path,
-				method: 'GET'
-			}, (res) => {
-				let data = '';
-
-				res.on('data', (chunk) => {
-					data += chunk;
+							try {
+								const parsedData = JSON.parse(data);
+								resolve(parsedData);
+							} catch (parseError) {
+								console.error('[Weather API] Failed to parse JSON:', parseError.message);
+								reject(new Error('Weather API returned invalid JSON'));
+							}
+						} else {
+							console.error(`[Weather API] Request failed with status ${res.statusCode}`);
+							reject(new Error(`Weather API request failed with status ${res.statusCode}`));
+						}
+					});
+				}).on('error', (err) => {
+					console.error('[Weather API] Request error:', err.message);
+					reject(err);
 				});
-
-				res.on('end', () => {
-					if (res.statusCode === 200) {
-						console.log('[Weather API] Successfully retrieved weather data');
-						resolve(JSON.parse(data));
-					} else {
-						console.error(`[Weather API] Request failed with status ${res.statusCode}`);
-						reject(new Error(`Weather API request failed with status ${res.statusCode}`));
-					}
-				});
-			}).on('error', (err) => {
-				console.error('[Weather API] Request error:', err.message);
-				reject(err);
 			});
-		});
-	} catch (error) {
-		console.error('[Weather API] Exception:', error.message);
-		throw new Error(`Failed to fetch weather data: ${error.message}`);
+
+			return result; // Success, return immediately
+
+		} catch (error) {
+			console.error(`[Weather API] Attempt ${attempt + 1} failed:`, error.message);
+
+			if (attempt === retries) {
+				// Final attempt failed
+				throw new Error(`Failed to fetch weather data after ${retries + 1} attempts: ${error.message}`);
+			}
+
+			// Wait a bit before retrying
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
 	}
 }
 
