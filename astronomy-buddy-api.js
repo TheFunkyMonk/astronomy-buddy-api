@@ -158,173 +158,231 @@ function convertToLightDistance(distanceKm) {
 	};
 }
 
+// 7timer index scales (IMPORTANT: for all three, a LOWER value is better):
+//   cloudcover   1-9  (1 = 0-6% cloud cover, 9 = 94-100%)
+//   seeing       1-8  (1 = <0.5" seeing, 8 = >2.5")
+//   transparency 1-8  (1 = clearest air, 8 = most dimming)
+// A point only counts as genuinely observable when cloud cover is at or below
+// this index (~19% cloud). The old logic used < 6 (~56%), which labelled
+// heavily-clouded nights as "clear".
+const CLEAR_CLOUD_INDEX = 2;
+const HOURS_PER_POINT = 3; // 7timer astro forecasts in 3-hour steps
+
+// Approximate a location's UTC offset from its longitude. This is not DST- or
+// political-boundary-aware, but it is accurate enough to bucket 3-hourly
+// forecast points into the correct local evening (which is all we need).
+function approxUtcOffset(longitude) {
+	const offset = Math.round(Number(longitude) / 15);
+	return Math.max(-12, Math.min(14, isNaN(offset) ? 0 : offset));
+}
+
+// Convert an averaged cloud-cover index (1-9) to an approximate percentage.
+function cloudIndexToPct(index) {
+	return Math.max(0, Math.min(100, Math.round(((index - 1) / 8) * 100)));
+}
+
+// Convert a seeing/transparency index (1-8, lower = better) to a plain word.
+function qualityWord(index) {
+	if (index <= 2) return 'excellent';
+	if (index <= 4) return 'good';
+	if (index <= 6) return 'fair';
+	return 'poor';
+}
+
+function isEveningHour(hour, startHour, endHour) {
+	if (endHour > startHour) {
+		return hour >= startHour && hour <= endHour;
+	}
+	return hour >= startHour || hour <= endHour;
+}
+
 // Weather condition interpretation from 7timer
-function interpretWeatherConditions(data, eveningStartHour, eveningEndHour) {
-	console.log(`[Weather] Interpreting conditions for hours ${eveningStartHour}-${eveningEndHour}`);
+function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, longitude) {
+	console.log(`[Weather] Interpreting conditions for local hours ${eveningStartHour}-${eveningEndHour}`);
 
-	const eveningData = data.dataseries.filter(point => {
-		const hour = (point.timepoint % 24);
-		if (eveningEndHour > eveningStartHour) {
-			return hour >= eveningStartHour && hour <= eveningEndHour;
-		} else {
-			return hour >= eveningStartHour || hour <= eveningEndHour;
-		}
-	});
+	if (!data || !Array.isArray(data.dataseries) || data.dataseries.length === 0) {
+		console.log('[Weather] No forecast data available');
+		return null;
+	}
 
-	console.log(`[Weather] Found ${eveningData.length} data points for evening hours`);
+	// `init` is the UTC datetime (YYYYMMDDHH) the model was run; each point's
+	// `timepoint` is the number of hours AFTER init. A point's true local hour
+	// therefore depends on both the init hour and the location's UTC offset --
+	// it is NOT `timepoint % 24` (that was the core bug: with init at 12:00 UTC,
+	// filtering for "21:00" actually selected the 09:00 UTC forecast).
+	const initHourUtc = parseInt(String(data.init).slice(8, 10), 10) || 0;
+	const utcOffset = approxUtcOffset(longitude);
+	const crossesMidnight = eveningEndHour <= eveningStartHour;
 
-	if (eveningData.length === 0) {
+	// Tag every point with its local hour and the "night" it belongs to, then
+	// keep only the earliest night present -- i.e. tonight. The old code averaged
+	// the same clock-hour across all 3 forecast days, smearing tonight together
+	// with future nights.
+	const eveningPoints = data.dataseries
+		.map(point => {
+			const absLocalHour = initHourUtc + point.timepoint + utcOffset;
+			const localHour = ((absLocalHour % 24) + 24) % 24;
+			const dayIndex = Math.floor(absLocalHour / 24);
+			// Early-morning hours belong to the PREVIOUS evening's night.
+			const nightKey = (crossesMidnight && localHour <= eveningEndHour) ? dayIndex - 1 : dayIndex;
+			return { point, localHour, nightKey };
+		})
+		.filter(p => isEveningHour(p.localHour, eveningStartHour, eveningEndHour));
+
+	if (eveningPoints.length === 0) {
 		console.log('[Weather] No evening data available');
 		return null;
 	}
 
-	// Calculate overall averages
+	const tonightKey = Math.min(...eveningPoints.map(p => p.nightKey));
+	const eveningData = eveningPoints
+		.filter(p => p.nightKey === tonightKey)
+		.sort((a, b) => a.point.timepoint - b.point.timepoint)
+		.map(p => ({ ...p.point, localHour: p.localHour }));
+
+	console.log(`[Weather] Using ${eveningData.length} point(s) for tonight (utcOffset ${utcOffset})`);
+
+	// Averages across tonight only.
 	const avgCloudCover = eveningData.reduce((sum, d) => sum + d.cloudcover, 0) / eveningData.length;
 	const avgSeeing = eveningData.reduce((sum, d) => sum + d.seeing, 0) / eveningData.length;
 	const avgTransparency = eveningData.reduce((sum, d) => sum + d.transparency, 0) / eveningData.length;
 	const hasRain = eveningData.some(d => d.prec_type === 'rain' || d.prec_type === 'snow');
 
-	// Identify clear viewing windows (cloud cover < 6, no precipitation)
+	const nightHours = eveningData.length * HOURS_PER_POINT;
+
+	// How much of the night is genuinely clear -- the primary driver of quality.
+	const clearPoints = eveningData.filter(d => d.cloudcover <= CLEAR_CLOUD_INDEX && d.prec_type === 'none').length;
+	const clearHours = clearPoints * HOURS_PER_POINT;
+	const clearFraction = clearPoints / eveningData.length;
+
+	// Group consecutive clear points into windows (strict cloud threshold).
 	const clearWindows = [];
 	let currentWindow = null;
-
-	for (let i = 0; i < eveningData.length; i++) {
-		const point = eveningData[i];
-		const hour = (point.timepoint % 24);
-		const isGoodCondition = point.cloudcover < 6 && point.prec_type === 'none';
-
-		if (isGoodCondition) {
+	for (const d of eveningData) {
+		const isClear = d.cloudcover <= CLEAR_CLOUD_INDEX && d.prec_type === 'none';
+		if (isClear) {
 			if (!currentWindow) {
-				currentWindow = {
-					startHour: hour,
-					endHour: hour,
-					cloudCover: [point.cloudcover],
-					seeing: [point.seeing],
-					transparency: [point.transparency]
-				};
-			} else {
-				currentWindow.endHour = hour;
-				currentWindow.cloudCover.push(point.cloudcover);
-				currentWindow.seeing.push(point.seeing);
-				currentWindow.transparency.push(point.transparency);
+				currentWindow = { startHour: d.localHour, endHour: d.localHour, cloudCover: [], seeing: [], transparency: [] };
 			}
+			currentWindow.endHour = d.localHour;
+			currentWindow.cloudCover.push(d.cloudcover);
+			currentWindow.seeing.push(d.seeing);
+			currentWindow.transparency.push(d.transparency);
 		} else if (currentWindow) {
-			// End of clear window
 			clearWindows.push(currentWindow);
 			currentWindow = null;
 		}
 	}
-
-	// Don't forget to add the last window if it exists
 	if (currentWindow) {
 		clearWindows.push(currentWindow);
 	}
 
-	// Calculate window statistics
+	// Each point covers the 3-hour block that follows it, so the window's end is
+	// its last point's hour + one block.
 	const viewingWindows = clearWindows.map(window => {
-		const avgCC = window.cloudCover.reduce((a, b) => a + b, 0) / window.cloudCover.length;
-		const avgS = window.seeing.reduce((a, b) => a + b, 0) / window.seeing.length;
-		const avgT = window.transparency.reduce((a, b) => a + b, 0) / window.transparency.length;
-
+		const avg = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+		const endHour = (window.endHour + HOURS_PER_POINT) % 24;
 		return {
 			startHour: window.startHour,
-			endHour: window.endHour,
+			endHour,
 			startTime: formatTime12Hour(window.startHour),
-			endTime: formatTime12Hour(window.endHour),
-			duration: window.cloudCover.length * 3, // Each point is 3 hours
-			avgCloudCover: parseFloat(avgCC.toFixed(1)),
-			avgSeeing: parseFloat(avgS.toFixed(1)),
-			avgTransparency: parseFloat(avgT.toFixed(1))
+			endTime: formatTime12Hour(endHour),
+			duration: window.cloudCover.length * HOURS_PER_POINT,
+			avgCloudCover: parseFloat(avg(window.cloudCover).toFixed(1)),
+			avgSeeing: parseFloat(avg(window.seeing).toFixed(1)),
+			avgTransparency: parseFloat(avg(window.transparency).toFixed(1))
 		};
 	});
 
-	let quality = 'excellent';
-	let score = 0;
-	let reasons = [];
-	let worthObserving = true;
+	// Quality is driven by the fraction of the night that is actually clear.
+	let quality;
+	let worthObserving;
+	let score;
+	const reasons = [];
 
-	// If we have rain, it's unsuitable regardless
 	if (hasRain) {
-		score += 4;
-		reasons.push('precipitation expected');
 		quality = 'unsuitable';
 		worthObserving = false;
-	}
-	// If we have clear windows, report partial conditions
-	else if (viewingWindows.length > 0 && avgCloudCover >= 6) {
-		quality = 'partial';
-		reasons.push(`clear viewing windows available (${viewingWindows.length} window${viewingWindows.length > 1 ? 's' : ''})`);
-
-		// Add details about the windows
-		if (avgCloudCover >= 7) {
-			reasons.push('heavy cloud cover during other times');
-		} else {
-			reasons.push('moderate cloud cover during other times');
-		}
-
+		score = 5;
+		reasons.push('precipitation expected');
+	} else if (clearFraction >= 0.85) {
+		quality = 'excellent';
 		worthObserving = true;
-		score = 1; // Better than poor, not as good as consistently clear
+		score = 0;
+		reasons.push('clear skies nearly all night');
+	} else if (clearFraction >= 0.65) {
+		quality = 'good';
+		worthObserving = true;
+		score = 1;
+		reasons.push(`mostly clear (~${clearHours}h of ${nightHours}h)`);
+	} else if (clearPoints > 0) {
+		// A real clear window exists, but a meaningful part of the night is
+		// clouded -- this is the "clear early, then cloudy" case.
+		quality = 'partial';
+		worthObserving = true;
+		score = 2;
+		reasons.push(`limited clear window (~${clearHours}h of ${nightHours}h)`);
+		reasons.push('cloudy the rest of the night');
+	} else if (avgCloudCover >= 7) {
+		quality = 'unsuitable';
+		worthObserving = false;
+		score = 4;
+		reasons.push('heavy cloud cover all night');
+	} else {
+		quality = 'poor';
+		worthObserving = false;
+		score = 3;
+		reasons.push('no clear window tonight');
 	}
-	// No clear windows but overall conditions evaluation
-	else {
-		if (avgCloudCover >= 7) {
-			score += 3;
-			reasons.push('heavy cloud cover');
-			quality = 'poor';
-			worthObserving = false;
-		} else if (avgCloudCover >= 5) {
-			score += 2;
-			reasons.push('moderate cloud cover');
-			quality = 'fair';
-			worthObserving = true;
-		} else if (avgCloudCover >= 3) {
-			score += 1;
-			reasons.push('some clouds');
-			quality = 'good';
-		} else {
-			reasons.push('clear skies');
+
+	// Seeing / transparency only refine a mostly-clear sky, and can nudge
+	// "excellent" down a notch -- never rescue a clouded-out night. On a partial
+	// night the headline is the limited window, so this detail is just noise.
+	if (quality === 'excellent' || quality === 'good') {
+		if (avgSeeing >= 6) {
+			reasons.push('turbulent atmosphere (soft views)');
+			if (quality === 'excellent') quality = 'good';
+		} else if (avgSeeing <= 3) {
+			reasons.push('steady atmosphere');
 		}
 
-		if (avgSeeing <= 3) {
-			score += 2;
-			reasons.push('poor atmospheric stability');
-			quality = quality === 'excellent' ? 'fair' : (quality === 'good' ? 'fair' : quality);
-		} else if (avgSeeing <= 5) {
-			reasons.push('average atmospheric stability');
-		} else {
-			reasons.push('excellent atmospheric stability');
-		}
-
-		if (avgTransparency <= 3) {
-			score += 1;
-			reasons.push('reduced transparency');
-		} else if (avgTransparency >= 6) {
+		if (avgTransparency >= 6) {
+			reasons.push('hazy / poor transparency');
+			if (quality === 'excellent') quality = 'good';
+		} else if (avgTransparency <= 3) {
 			reasons.push('excellent transparency');
 		}
-
-		// Recheck worth observing based on final quality
-		worthObserving = quality !== 'unsuitable' && quality !== 'poor';
 	}
 
-	console.log(`[Weather] Quality: ${quality}, Cloud cover: ${avgCloudCover.toFixed(1)}, Clear windows: ${viewingWindows.length}`);
+	console.log(`[Weather] Quality: ${quality}, clear ${clearHours}/${nightHours}h, avgCloud ${avgCloudCover.toFixed(1)}`);
 
 	const result = {
 		quality,
 		score,
 		worthObserving,
-		avgCloudCover: Math.round(avgCloudCover),
+		avgCloudCover: parseFloat(avgCloudCover.toFixed(1)),
 		avgSeeing: parseFloat(avgSeeing.toFixed(1)),
 		avgTransparency: parseFloat(avgTransparency.toFixed(1)),
+		cloudCoverPct: cloudIndexToPct(avgCloudCover),
+		seeingText: qualityWord(avgSeeing),
+		transparencyText: qualityWord(avgTransparency),
+		clearHours,
+		nightHours,
+		clearFraction: parseFloat(clearFraction.toFixed(2)),
 		hasRain,
 		reasons
 	};
 
-	// Add viewing windows if any exist
+	// Add viewing windows if any exist. The "best" window is the longest one,
+	// tie-broken by lowest average cloud cover.
 	if (viewingWindows.length > 0) {
 		result.viewingWindows = viewingWindows;
-		result.bestWindow = viewingWindows.reduce((best, current) =>
-			current.avgCloudCover < best.avgCloudCover ? current : best
-		);
+		result.bestWindow = viewingWindows.reduce((best, current) => {
+			if (current.duration !== best.duration) {
+				return current.duration > best.duration ? current : best;
+			}
+			return current.avgCloudCover < best.avgCloudCover ? current : best;
+		});
 	}
 
 	return result;
@@ -579,7 +637,7 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 	// Get weather conditions
 	try {
 		const weatherData = await getWeatherConditions(latitude, longitude);
-		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour);
+		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour, longitude);
 	} catch (error) {
 		console.error('[Main] Weather data error:', error.message);
 		result.weather = {
@@ -885,18 +943,27 @@ const server = http.createServer(async (req, res) => {
 	}));
 });
 
-// Start server
-server.listen(config.port, () => {
-	console.log(`[Server] Astronomy Buddy API running on port ${config.port}`);
-	console.log(`[Server] Example: http://localhost:${config.port}/viewing-data?latitude=47.6062&longitude=-122.3321&elevation=50`);
-	console.log(`[Server] Health check: http://localhost:${config.port}/health`);
-});
-
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-	console.log('[Server] SIGTERM received, closing server...');
-	server.close(() => {
-		console.log('[Server] Server closed');
-		process.exit(0);
+// Start server only when run directly (so the module can be imported in tests)
+if (require.main === module) {
+	server.listen(config.port, () => {
+		console.log(`[Server] Astronomy Buddy API running on port ${config.port}`);
+		console.log(`[Server] Example: http://localhost:${config.port}/viewing-data?latitude=47.6062&longitude=-122.3321&elevation=50`);
+		console.log(`[Server] Health check: http://localhost:${config.port}/health`);
 	});
-});
+
+	// Handle graceful shutdown
+	process.on('SIGTERM', () => {
+		console.log('[Server] SIGTERM received, closing server...');
+		server.close(() => {
+			console.log('[Server] Server closed');
+			process.exit(0);
+		});
+	});
+}
+
+module.exports = {
+	interpretWeatherConditions,
+	approxUtcOffset,
+	cloudIndexToPct,
+	qualityWord
+};

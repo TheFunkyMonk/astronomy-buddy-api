@@ -141,13 +141,19 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 		"quality": "good",
 		"score": 1,
 		"worthObserving": true,
-		"avgCloudCover": 2,
-		"avgSeeing": 6.3,
-		"avgTransparency": 7.1,
+		"avgCloudCover": 2.5,
+		"avgSeeing": 3.0,
+		"avgTransparency": 2.5,
+		"cloudCoverPct": 19,
+		"seeingText": "good",
+		"transparencyText": "excellent",
+		"clearHours": 6,
+		"nightHours": 6,
+		"clearFraction": 1,
 		"hasRain": false,
 		"reasons": [
-			"clear skies",
-			"excellent atmospheric stability",
+			"mostly clear (~6h of 6h)",
+			"steady atmosphere",
 			"excellent transparency"
 		]
 	},
@@ -240,14 +246,37 @@ curl http://localhost:3000/health
 - `targets` (object): Categorized celestial targets
 
 **Weather Object:**
-- `quality` (string): Overall viewing quality (excellent/good/fair/poor/unsuitable)
-- `score` (number): Numerical quality score (lower is better)
-- `worthObserving` (boolean): Whether conditions are suitable for observing
-- `avgCloudCover` (number): Cloud cover rating (1-9, 1=clear)
-- `avgSeeing` (number): Atmospheric stability (1-8, 8=best)
-- `avgTransparency` (number): Atmospheric transparency (1-8, 8=best)
+
+Quality reflects only the **upcoming night** (tonight's configured evening
+window, in the location's local time) and is driven primarily by how much of
+that window is genuinely clear:
+
+- `excellent`: ~85%+ of the night clear
+- `good`: ~65%+ of the night clear
+- `partial`: a real clear window exists, but a meaningful part of the night is clouded (the "clear early, then cloudy" case)
+- `poor`: no genuinely clear window; mostly cloudy
+- `unsuitable`: overcast all night or precipitation expected
+
+Fields:
+- `quality` (string): Overall viewing quality (excellent/good/partial/poor/unsuitable)
+- `score` (number): Numerical quality score (0 = best, 5 = worst)
+- `worthObserving` (boolean): Whether conditions are suitable for observing (true for excellent/good/partial)
+- `avgCloudCover` (number): Average cloud cover index for the night (1-9, **lower is better**, 1 = clear)
+- `avgSeeing` (number): Average seeing index (1-8, **lower is better**, 1 = steadiest)
+- `avgTransparency` (number): Average transparency index (1-8, **lower is better**, 1 = clearest air)
+- `cloudCoverPct` (number): `avgCloudCover` expressed as an approximate percentage (0-100)
+- `seeingText` (string): Human-friendly seeing rating (excellent/good/fair/poor)
+- `transparencyText` (string): Human-friendly transparency rating (excellent/good/fair/poor)
+- `clearHours` (number): Approximate hours of genuinely clear sky during the window
+- `nightHours` (number): Approximate length of the evening viewing window, in hours
+- `clearFraction` (number): Fraction of the window that is clear (0-1)
 - `hasRain` (boolean): Whether precipitation is expected
 - `reasons` (array): Human-readable weather factors
+
+> **Note on 7timer scales:** cloud cover, seeing, and transparency are all
+> reported by 7timer as indices where a **lower number is better**. Earlier
+> versions of this API treated seeing/transparency as "higher is better",
+> which inverted those factors.
 
 **Target Object:**
 - `name` (string): Celestial body name
@@ -484,8 +513,9 @@ function AstronomyView({ latitude, longitude, elevation }) {
 		<div>
 			<h1>Viewing Conditions for {data.location.name}</h1>
 			<h2>Weather: {data.weather.quality}</h2>
-			<p>Cloud cover: {data.weather.avgCloudCover}/9</p>
-			<p>Atmospheric stability: {data.weather.avgSeeing}/8</p>
+			<p>Cloud cover: ~{data.weather.cloudCoverPct}%</p>
+			<p>Clear tonight: {data.weather.clearHours}h of {data.weather.nightHours}h</p>
+			<p>Seeing: {data.weather.seeingText}</p>
 
 			{data.weather.worthObserving ? (
 				<div>
