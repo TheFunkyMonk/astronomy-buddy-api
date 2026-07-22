@@ -47,7 +47,7 @@ function formatTime12Hour(hour) {
 // Reverse geocode coordinates to get location name
 async function getLocationName(latitude, longitude) {
 	const apiUrl = `https://nominatim.openstreetmap.org/reverse?` +
-		`lat=${latitude}&lon=${longitude}&format=json`;
+		`lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`;
 
 	console.log(`[Geocoding] Looking up location for lat=${latitude}, lon=${longitude}`);
 
@@ -72,23 +72,41 @@ async function getLocationName(latitude, longitude) {
 				res.on('end', () => {
 					if (res.statusCode === 200) {
 						const result = JSON.parse(data);
-						const address = result.address;
+						const address = result.address || {};
 
-						// Try to build a "City, State" or "City, Country" format
-						let locationName = '';
+						// Most specific place name available
+						const place = address.city
+							|| address.town
+							|| address.village
+							|| address.hamlet
+							|| address.county
+							|| '';
 
-						if (address.city) {
-							locationName = address.city;
-						} else if (address.town) {
-							locationName = address.town;
-						} else if (address.village) {
-							locationName = address.village;
-						} else if (address.county) {
-							locationName = address.county;
+						// Friendly region: US/CA state abbreviation when we can get it
+						// (Nominatim exposes it as e.g. "US-WA" in ISO3166-2-lvl4),
+						// otherwise fall back to the country, then the full state name.
+						const countryCode = (address.country_code || '').toLowerCase();
+						const isoSubdivision = address['ISO3166-2-lvl4'] || '';
+						let region = '';
+
+						if ((countryCode === 'us' || countryCode === 'ca') && isoSubdivision.includes('-')) {
+							region = isoSubdivision.split('-')[1];
+						} else if (address.country) {
+							region = address.country;
+						} else if (address.state) {
+							region = address.state;
 						}
 
-						console.log(`[Geocoding] Location: ${locationName || 'Unknown'}`);
-						resolve(locationName || 'Unknown Location');
+						// Build a "City, WA" / "Paris, France" style label
+						let locationName;
+						if (place && region) {
+							locationName = `${place}, ${region}`;
+						} else {
+							locationName = place || region || 'Unknown Location';
+						}
+
+						console.log(`[Geocoding] Location: ${locationName}`);
+						resolve(locationName);
 					} else {
 						console.error(`[Geocoding] Request failed with status ${res.statusCode}`);
 						resolve('Unknown Location');
