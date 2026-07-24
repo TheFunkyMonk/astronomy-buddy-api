@@ -215,7 +215,7 @@ function isEveningHour(hour, startHour, endHour) {
 }
 
 // Weather condition interpretation from 7timer
-function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, longitude) {
+function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, longitude, viewingLevel) {
 	console.log(`[Weather] Interpreting conditions for local hours ${eveningStartHour}-${eveningEndHour}`);
 
 	if (!data || !Array.isArray(data.dataseries) || data.dataseries.length === 0) {
@@ -405,14 +405,16 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 
 	// Human-friendly copy, computed once here so every surface (web, iOS,
 	// TRMNL) renders consistent language without re-deriving it.
-	result.verdict = buildVerdict(quality, hasRain, result.bestWindow);
+	result.verdict = buildVerdict(quality, hasRain, result.bestWindow, viewingLevel);
 	result.summary = buildClearSummary(clearHours, nightHours, clearFraction);
 
 	return result;
 }
 
-// Plain-language headline verdict for the night.
-function buildVerdict(quality, hasRain, bestWindow) {
+// Plain-language headline verdict for the night. Copy adapts to the viewing
+// level so naked-eye observers don't get telescope-specific wording.
+function buildVerdict(quality, hasRain, bestWindow, viewingLevel) {
+	const usesTelescope = viewingLevel && viewingLevel !== 'naked-eye';
 	switch (quality) {
 		case 'excellent':
 			return 'Great night for stargazing!';
@@ -423,9 +425,14 @@ function buildVerdict(quality, hasRain, bestWindow) {
 				? `Your clear window is ${bestWindow.startTime}–${bestWindow.endTime}; mostly cloudy otherwise.`
 				: 'A short clear window tonight, then mostly cloudy.';
 		case 'unsuitable':
-			return hasRain
-				? 'Rain expected — not a night for the telescope.'
-				: 'Clouded out — not worth setting up tonight.';
+			if (hasRain) {
+				return usesTelescope
+					? 'Rain expected — not a night for the telescope.'
+					: 'Rain expected — not a night for stargazing.';
+			}
+			return usesTelescope
+				? 'Clouded out — not worth setting up tonight.'
+				: 'Clouded out — not worth heading out tonight.';
 		default:
 			return 'Mostly cloudy tonight — not ideal for stargazing.';
 	}
@@ -697,7 +704,7 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 	// Get weather conditions
 	try {
 		const weatherData = await getWeatherConditions(latitude, longitude);
-		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour, longitude);
+		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour, longitude, viewingLevel);
 	} catch (error) {
 		console.error('[Main] Weather data error:', error.message);
 		result.weather = {
