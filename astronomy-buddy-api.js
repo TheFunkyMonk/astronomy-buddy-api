@@ -318,39 +318,36 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 	let score;
 	const reasons = [];
 
+	// Cloud/coverage wording is intentionally NOT added to `reasons` -- that
+	// story is told by `verdict` (headline) and `summary` (how much is clear).
+	// `reasons` carries only supplementary atmospheric detail, so the surfaces
+	// never show two near-identical sentences side by side.
 	if (hasRain) {
 		quality = 'unsuitable';
 		worthObserving = false;
 		score = 5;
-		reasons.push('rain or snow expected');
 	} else if (clearFraction >= 0.85) {
 		quality = 'excellent';
 		worthObserving = true;
 		score = 0;
-		reasons.push('clear skies nearly all night');
 	} else if (clearFraction >= 0.65) {
 		quality = 'good';
 		worthObserving = true;
 		score = 1;
-		reasons.push('mostly clear skies');
 	} else if (clearPoints > 0) {
 		// A real clear window exists, but a meaningful part of the night is
 		// clouded -- this is the "clear early, then cloudy" case.
 		quality = 'partial';
 		worthObserving = true;
 		score = 2;
-		reasons.push('a limited clear window');
-		reasons.push('cloudy the rest of the night');
 	} else if (avgCloudCover >= 7) {
 		quality = 'unsuitable';
 		worthObserving = false;
 		score = 4;
-		reasons.push('heavy cloud cover all night');
 	} else {
 		quality = 'poor';
 		worthObserving = false;
 		score = 3;
-		reasons.push('no clear window tonight');
 	}
 
 	// Seeing / transparency only refine a mostly-clear sky, and can nudge
