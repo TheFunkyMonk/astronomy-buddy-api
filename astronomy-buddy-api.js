@@ -322,7 +322,7 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		quality = 'unsuitable';
 		worthObserving = false;
 		score = 5;
-		reasons.push('precipitation expected');
+		reasons.push('rain or snow expected');
 	} else if (clearFraction >= 0.85) {
 		quality = 'excellent';
 		worthObserving = true;
@@ -332,14 +332,14 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		quality = 'good';
 		worthObserving = true;
 		score = 1;
-		reasons.push(`mostly clear (~${clearHours}h of ${nightHours}h)`);
+		reasons.push('mostly clear skies');
 	} else if (clearPoints > 0) {
 		// A real clear window exists, but a meaningful part of the night is
 		// clouded -- this is the "clear early, then cloudy" case.
 		quality = 'partial';
 		worthObserving = true;
 		score = 2;
-		reasons.push(`limited clear window (~${clearHours}h of ${nightHours}h)`);
+		reasons.push('a limited clear window');
 		reasons.push('cloudy the rest of the night');
 	} else if (avgCloudCover >= 7) {
 		quality = 'unsuitable';
@@ -358,14 +358,14 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 	// night the headline is the limited window, so this detail is just noise.
 	if (quality === 'excellent' || quality === 'good') {
 		if (avgSeeing >= 6) {
-			reasons.push('turbulent atmosphere (soft views)');
+			reasons.push('somewhat unsteady atmosphere');
 			if (quality === 'excellent') quality = 'good';
 		} else if (avgSeeing <= 3) {
 			reasons.push('steady atmosphere');
 		}
 
 		if (avgTransparency >= 6) {
-			reasons.push('hazy / poor transparency');
+			reasons.push('some haze');
 			if (quality === 'excellent') quality = 'good';
 		} else if (avgTransparency <= 3) {
 			reasons.push('excellent transparency');
@@ -403,7 +403,49 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		});
 	}
 
+	// Human-friendly copy, computed once here so every surface (web, iOS,
+	// TRMNL) renders consistent language without re-deriving it.
+	result.verdict = buildVerdict(quality, hasRain, result.bestWindow);
+	result.summary = buildClearSummary(clearHours, nightHours, clearFraction);
+
 	return result;
+}
+
+// Plain-language headline verdict for the night.
+function buildVerdict(quality, hasRain, bestWindow) {
+	switch (quality) {
+		case 'excellent':
+			return 'Great night for stargazing!';
+		case 'good':
+			return 'A good night for stargazing.';
+		case 'partial':
+			return bestWindow
+				? `Your clear window is ${bestWindow.startTime}–${bestWindow.endTime}; mostly cloudy otherwise.`
+				: 'A short clear window tonight, then mostly cloudy.';
+		case 'unsuitable':
+			return hasRain
+				? 'Rain expected — not a night for the telescope.'
+				: 'Clouded out — not worth setting up tonight.';
+		default:
+			return 'Mostly cloudy tonight — not ideal for stargazing.';
+	}
+}
+
+// One-line summary of how much of the night is actually clear.
+function buildClearSummary(clearHours, nightHours, clearFraction) {
+	if (!nightHours || nightHours <= 0) return null;
+	if (clearHours <= 0) return 'No clear skies expected during your window tonight.';
+
+	const clear = Math.round(clearHours);
+	const night = Math.round(nightHours);
+	const fraction = (clearFraction === undefined || clearFraction === null)
+		? clearHours / nightHours
+		: clearFraction;
+
+	if (fraction >= 0.95) return 'Clear skies the entire night.';
+	if (fraction >= 0.75) return `Clear for most of the night — about ${clear} of ${night} hours.`;
+	if (fraction >= 0.45) return `Clear for roughly half the night — about ${clear} of ${night} hours.`;
+	return `About ${clear} of the ${night}-hour window looks clear.`;
 }
 
 // Get weather conditions from 7timer
