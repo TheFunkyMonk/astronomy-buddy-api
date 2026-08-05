@@ -327,21 +327,58 @@ two are therefore tracked separately and used for different things:
 
 | AOD | `level` | Effect |
 | --- | --- | --- |
-| < 0.10 | `pristine` | "Exceptional transparency" call-out |
-| 0.10 – 0.20 | `none` | No mention (normal continental background) |
-| 0.20 – 0.35 | `slight` | Mentioned in `reasons`; suppresses any "excellent transparency" claim |
-| 0.35 – 0.55 | `moderate` | Downgrades `excellent` → `good` |
-| 0.55 – 0.90 | `significant` | Downgrades `excellent` → `good`; smoke leads the `verdict` |
-| > 0.90 | `heavy` | Forces `quality` to `poor` and `worthObserving` to `false` |
+| < 0.08 | `pristine` | "Exceptional transparency" call-out |
+| 0.08 – 0.15 | `none` | No mention (normal continental background) |
+| 0.15 – 0.25 | `slight` | Mentioned in `reasons`; suppresses any "excellent transparency" claim |
+| 0.25 – 0.40 | `moderate` | Downgrades `excellent` → `good` |
+| 0.40 – 0.75 | `significant` | Downgrades `excellent`/`good` → `partial`; smoke leads the `verdict` |
+| > 0.75 | `heavy` | Forces `quality` to `poor` and `worthObserving` to `false` |
 
 Rain still outranks smoke: on a `unsuitable`/rainy night no aerosol copy is added.
 
-**Effect on targets.** Extinction at the zenith is `1.086 × AOD` magnitudes (call
-it double that low in the sky). That figure is subtracted from the effective
-faint limit when rating targets, so smoke prunes faint objects — they get
-`bestRating: "too-faint"` with the reason *"Too faint through tonight's haze"*
-and drop out of the results. `viewingCapabilities.maxMagnitude` is deliberately
-**not** modified: it advertises the equipment, not tonight's air.
+`significant` maps to `partial` rather than `good` on purpose. The sky may be
+cloudless all night, but only *part of it* is usable — high targets are fine
+while anything low is washed out. Note this makes `partial` mean two different
+things (a limited time window, or a limited part of the sky), so consumers should
+not assume `partial` implies cloud: check `airQuality.level` before rendering
+clear-window copy. The web app, iOS app, and TRMNL template all do this.
+
+> **Calibration.** These boundaries were lowered after a field check in Seattle
+> on 2026-08-04. An evening averaging **AOD 0.42** was rated `good` by the
+> original thresholds, but on the ground it was clearly only partial viewing:
+> stars high overhead were fine, the Moon low down was difficult, and Saturn low
+> down was completely invisible. Published AOD tables describe *daytime*
+> visibility, which is more forgiving than picking faint point sources out of a
+> scattering night sky, so erring darker is correct. Refine as more nights are
+> checked.
+
+**Effect on targets — extinction scales with airmass.** This is the important
+part, and getting it wrong is what made the first version too lenient.
+Extinction is `1.086 × AOD` magnitudes *per unit airmass*, and airmass climbs
+steeply toward the horizon (Kasten & Young 1989):
+
+| Altitude | Airmass | Loss at AOD 0.42 |
+| --- | --- | --- |
+| 90° (zenith) | 1.00 | 0.46 mag |
+| 60° | 1.15 | 0.53 mag |
+| 30° | 1.99 | 0.91 mag |
+| 20° | 2.90 | 1.32 mag |
+| 15° | 3.81 | 1.74 mag |
+| 10° | 5.59 | 2.55 mag |
+
+So each target is rated against the extinction at *its own* altitude for that
+hour, not a flat zenith figure. Two consequences:
+
+- Faint targets get `bestRating: "too-faint"` with the reason *"Too faint through
+  tonight's haze"* and drop out of the results.
+- Targets far too bright to ever be "too faint" are still demoted on the
+  extinction they actually suffer: `≥ 0.8` mag knocks the rating down one step
+  (*"dimmed by haze"*), `≥ 1.5` mag forces `poor` (*"badly dimmed by haze low in
+  the sky"*). This is what correctly demotes a low Moon or Saturn.
+
+`viewingCapabilities.maxMagnitude` is deliberately **not** modified: it
+advertises the equipment, not tonight's air (and consumers decode it as an
+integer).
 
 **Fields (all optional; the whole object is absent if the upstream is
 unreachable):**
@@ -349,7 +386,7 @@ unreachable):**
 - `aodPeak` (number): Highest hourly AOD in the window
 - `level` (string): One of `pristine`, `none`, `slight`, `moderate`, `significant`, `heavy`
 - `aerosolType` (string): `smoke`, `dust`, or `haze` — used to name the right thing in copy
-- `extinctionMagnitudes` (number): Magnitudes of dimming at the zenith (`1.086 × aod`)
+- `extinctionMagnitudes` (number): Magnitudes of dimming **at the zenith** (`1.086 × aod`). This is the best case — multiply by airmass for a given altitude (see the table above)
 - `pm25` (number|null): Average PM2.5 in µg/m³
 - `dust` (number|null): Average dust in µg/m³
 - `usAqi` (number|null): **Peak** US AQI during the window (peak, not average — the worst moment is what matters for health)

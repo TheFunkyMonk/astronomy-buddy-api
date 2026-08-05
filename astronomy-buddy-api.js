@@ -223,23 +223,24 @@ function isEveningHour(hour, startHour, endHour) {
 // that actually matters for stargazing: it measures how much the whole air
 // column dims and scatters starlight.
 //
-// Rough AOD reference points:
-//   < 0.10       pristine
-//   0.10 - 0.20  normal continental background
-//   0.20 - 0.35  visible haze
-//   0.35 - 0.55  moderate smoke/haze
-//   0.55 - 0.90  significant smoke
-//   > 0.90       heavy smoke
-//
 // Note that US AQI is a *health* metric and is a poor proxy for this: a night
 // can sit at AQI 60 ("moderate") while AOD is 0.7 and half the visible stars
 // are gone. The two are tracked separately and used for different things.
+//
+// CALIBRATION: these boundaries were lowered after a field check on 2026-08-04
+// in Seattle. An evening averaging AOD 0.42 was rated "good" by the original
+// thresholds, but on the ground it was clearly only partial viewing -- high
+// stars fine, the Moon low and difficult, Saturn low and completely invisible.
+// 0.42 therefore needs to land in `significant`, not `moderate`. Textbook AOD
+// tables describe daytime visibility, which is more forgiving than picking faint
+// point sources out of a scattering sky at night, so erring darker is right.
+// Refine further as more nights get checked.
 const AOD_LEVELS = [
-	{ max: 0.10, level: 'pristine' },
-	{ max: 0.20, level: 'none' },
-	{ max: 0.35, level: 'slight' },
-	{ max: 0.55, level: 'moderate' },
-	{ max: 0.90, level: 'significant' },
+	{ max: 0.08, level: 'pristine' },
+	{ max: 0.15, level: 'none' },
+	{ max: 0.25, level: 'slight' },
+	{ max: 0.40, level: 'moderate' },
+	{ max: 0.75, level: 'significant' },
 	{ max: Infinity, level: 'heavy' }
 ];
 
@@ -255,10 +256,34 @@ function aodLevel(aod) {
 
 // Extinction at the zenith for a given optical depth:
 //   dm = 2.5 * log10(e^tau) = 1.086 * tau   (per unit airmass)
-// Low in the sky this roughly doubles, but the zenith figure is the honest
-// headline number.
+// This is the headline number quoted to users, but it is the BEST case: it only
+// holds straight overhead. See airmass() for why low targets fare much worse.
 function aodToMagnitudes(aod) {
 	return 1.086 * aod;
+}
+
+// Relative airmass at a given altitude -- how many zenith-equivalents of
+// atmosphere the line of sight passes through. 1.0 overhead, ~2 at 30 degrees,
+// ~3.8 at 15, and it climbs steeply from there.
+//
+// This is the whole reason smoke feels worse than a zenith figure suggests. On a
+// night with 0.45 mag of extinction overhead, a target at 15 degrees loses about
+// 1.7 mag -- which is the difference between "dimmed" and "gone". Observed
+// 2026-08-04: Saturn low in the sky was completely invisible while stars high
+// overhead were fine, on a night the API had called "good".
+//
+// Kasten & Young (1989), accurate all the way to the horizon (unlike sec z,
+// which diverges).
+function airmass(altitudeDegrees) {
+	const altitude = Math.max(0, Math.min(90, altitudeDegrees));
+	const zenithAngle = 90 - altitude;
+	const radians = zenithAngle * Math.PI / 180;
+	return 1 / (Math.cos(radians) + 0.50572 * Math.pow(96.07995 - zenithAngle, -1.6364));
+}
+
+// Aerosol extinction actually suffered by a target at a given altitude.
+function extinctionAtAltitude(zenithMagnitudes, altitudeDegrees) {
+	return zenithMagnitudes * airmass(altitudeDegrees);
 }
 
 // Distinguish smoke from blown dust so the copy can name the right thing.
@@ -282,23 +307,30 @@ function aerosolLabel(level, type) {
 	}
 }
 
-// One sentence on what the aerosol load does to the view.
+// One sentence on what the aerosol load does to the view. Quotes BOTH the zenith
+// figure and the figure low in the sky: the zenith number alone badly understates
+// what an observer experiences, because most disappointing targets are the low
+// ones. LOW_ALTITUDE_REFERENCE is the altitude the "low in the sky" figure is
+// quoted at -- around where a target starts clearing typical obstructions.
+const LOW_ALTITUDE_REFERENCE = 20;
+
 function buildTransparencyImpact(level, type, magnitudes) {
 	const noun = type === 'haze' ? 'haze' : type;
 	const dimming = magnitudes.toFixed(1);
+	const lowDimming = extinctionAtAltitude(magnitudes, LOW_ALTITUDE_REFERENCE).toFixed(1);
 	switch (level) {
 		case 'pristine':
 			return 'Exceptionally transparent air tonight — faint objects should show well.';
 		case 'none':
 			return null;
 		case 'slight':
-			return `A little ${noun} in the air, costing roughly ${dimming} magnitudes — barely noticeable.`;
+			return `A little ${noun} in the air, costing roughly ${dimming} magnitudes overhead — barely noticeable.`;
 		case 'moderate':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith, so fainter objects will be harder to pick out.`;
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead and about ${lowDimming} low in the sky, so fainter objects will be harder to pick out near the horizon.`;
 		case 'significant':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith — expect fainter stars to be washed out, though the Moon and bright planets cut through fine.`;
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead but about ${lowDimming} at ${LOW_ALTITUDE_REFERENCE}° up — targets high overhead are still worth it, while anything low will be washed out or invisible.`;
 		case 'heavy':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith and more low in the sky, washing out all but the brightest objects.`;
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead and about ${lowDimming} low in the sky, washing out all but the brightest objects.`;
 		default:
 			return null;
 	}
@@ -637,9 +669,18 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		}
 
 		// Aerosols are a separate story from water vapour and get their own say.
+		//
+		// `significant` lands on 'partial' rather than 'good': the sky may be
+		// cloudless all night, but only part of it is usable -- high targets are
+		// fine while anything low is washed out. That is partial viewing, and it
+		// matches what an observer actually experiences (2026-08-04: high stars
+		// fine, low Saturn invisible, on a night this called "good").
 		if (air && air.dimsView) {
 			reasons.push(air.label.toLowerCase());
-			if ((air.level === 'moderate' || air.level === 'significant') && quality === 'excellent') {
+			if (air.level === 'significant' && (quality === 'excellent' || quality === 'good')) {
+				quality = 'partial';
+				score = 2;
+			} else if (air.level === 'moderate' && quality === 'excellent') {
 				quality = 'good';
 				score = 1;
 			}
@@ -733,9 +774,9 @@ function buildAerosolClause(air, quality) {
 		case 'heavy':
 			return `${air.label} is washing the sky out — worth saving for a clearer night.`;
 		case 'significant':
-			return `${air.label} will wash out fainter stars, though the Moon and bright planets still cut through.`;
+			return `${air.label} is washing out anything low in the sky — stick to targets high overhead.`;
 		case 'moderate':
-			return `${air.label} is taking the edge off — fainter objects will be harder to pick out.`;
+			return `${air.label} is taking the edge off, especially low in the sky.`;
 		default:
 			return null;
 	}
@@ -753,8 +794,13 @@ function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 	if (air && air.level === 'heavy' && quality === 'poor') {
 		return `${air.label} tonight — the sky may be clear, but it is washed out. Worth waiting for cleaner air.`;
 	}
-	if (air && air.level === 'significant' && (quality === 'excellent' || quality === 'good')) {
-		return `Clear skies, but ${air.label.toLowerCase()} will wash out fainter stars — the Moon and bright planets still look good.`;
+	// Smoke-led, and specific about WHERE to look: the usable part of the sky is
+	// overhead. Note this fires on 'partial' too, which significant smoke now
+	// produces -- without it the partial branch below would talk about clear
+	// windows on what may be a cloudless night.
+	if (air && air.level === 'significant'
+		&& (quality === 'excellent' || quality === 'good' || quality === 'partial')) {
+		return `Clear skies, but ${air.label.toLowerCase()} is washing out anything low — stick to targets high overhead and expect the horizon to be a write-off.`;
 	}
 
 	let headline;
@@ -872,13 +918,21 @@ async function getWeatherConditions(latitude, longitude, retries = 2) {
 function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0) {
 	const altitude = parseFloat(body.position.horizontal.altitude.degrees);
 	const magnitude = body.extraInfo.magnitude;
-	const faintLimit = viewingCaps.maxMagnitude - magnitudePenalty;
+
+	// Scale the aerosol penalty by the airmass at THIS altitude rather than
+	// applying a flat zenith figure. A low target looks through several times
+	// more smoke than one overhead, and treating them alike is what let an
+	// invisible low Saturn keep an "excellent" rating.
+	const extinction = magnitudePenalty > 0
+		? extinctionAtAltitude(magnitudePenalty, altitude)
+		: 0;
+	const faintLimit = viewingCaps.maxMagnitude - extinction;
 
 	if (altitude < 0) return { rating: 'not-visible', reason: 'Below horizon' };
 	if (altitude < viewingCaps.minAltitude) return { rating: 'poor', reason: 'Too low on horizon' };
 	if (magnitude !== null && magnitude > faintLimit) {
 		// Distinguish "your gear cannot" from "tonight's air cannot".
-		if (magnitudePenalty > 0 && magnitude <= viewingCaps.maxMagnitude) {
+		if (extinction > 0 && magnitude <= viewingCaps.maxMagnitude) {
 			return { rating: 'too-faint', reason: 'Too faint through tonight\'s haze' };
 		}
 		return { rating: 'too-faint', reason: `Too faint for ${viewingLevel === 'naked-eye' ? 'naked eye' : 'your telescope'}` };
@@ -904,6 +958,18 @@ function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0)
 			rating = rating === 'excellent' ? 'good' : 'fair';
 			reason += ', relatively faint';
 		}
+	}
+
+	// Smoke also ruins targets far too bright to ever hit the faint limit -- the
+	// Moon and Saturn will never be "too faint", but low in heavy haze they are
+	// genuinely hard or impossible to pick out. Demote on the extinction actually
+	// suffered at this altitude.
+	if (extinction >= 1.5) {
+		rating = 'poor';
+		reason += ', badly dimmed by haze low in the sky';
+	} else if (extinction >= 0.8) {
+		rating = rating === 'excellent' ? 'good' : 'fair';
+		reason += ', dimmed by haze';
 	}
 
 	return { rating, reason };
@@ -1410,6 +1476,9 @@ module.exports = {
 	aerosolAwareTransparency,
 	aodLevel,
 	aodToMagnitudes,
+	airmass,
+	extinctionAtAltitude,
+	getViewingRating,
 	usAqiCategory,
 	getAirQuality
 };
