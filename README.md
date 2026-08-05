@@ -8,6 +8,7 @@ A Node.js REST API that provides celestial viewing recommendations based on loca
 - **Flexible Location**: Pass latitude, longitude, and elevation as query parameters
 - **Location Name Resolution**: Automatically geocodes coordinates to human-readable location names (City, State/Country)
 - **Weather-Aware Planning**: Real-time atmospheric conditions (cloud cover, seeing, transparency)
+- **Smoke & Haze Aware**: Factors aerosol optical depth into viewing quality, so wildfire smoke can no longer be reported as "excellent transparency" — and reports air quality separately as a health advisory
 - **Smart Target Analysis**: Evaluates celestial objects throughout your evening viewing window
 - **Multiple Viewing Options**: Supports naked eye viewing and telescope-specific ratings (entry, intermediate, advanced telescopes)
 - **Peak Viewing Times**: Identifies optimal viewing hour for each celestial target
@@ -24,6 +25,9 @@ A Node.js REST API that provides celestial viewing recommendations based on loca
 
 - Node.js v20.11 or higher
 - Astronomy API credentials (free tier available at https://astronomyapi.com)
+
+No credentials are needed for weather (7timer), air quality (Open-Meteo), or
+geocoding (Nominatim) — all three are keyless.
 
 ## Setup
 
@@ -146,16 +150,32 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 		"avgTransparency": 2.5,
 		"cloudCoverPct": 19,
 		"seeingText": "good",
-		"transparencyText": "excellent",
+		"transparencyText": "fair",
 		"clearHours": 6,
 		"nightHours": 6,
 		"clearFraction": 1,
 		"hasRain": false,
 		"reasons": [
-			"mostly clear (~6h of 6h)",
 			"steady atmosphere",
-			"excellent transparency"
-		]
+			"moderate smoke haze"
+		],
+		"verdict": "A good night for stargazing. Moderate smoke haze is taking the edge off — fainter objects will be harder to pick out.",
+		"summary": "Clear skies the entire night.",
+		"airQuality": {
+			"aod": 0.42,
+			"aodPeak": 0.47,
+			"level": "moderate",
+			"aerosolType": "smoke",
+			"extinctionMagnitudes": 0.45,
+			"pm25": 20.9,
+			"dust": 0,
+			"usAqi": 75,
+			"healthCategory": "moderate",
+			"healthAdvisory": null,
+			"label": "Moderate smoke haze",
+			"transparencyImpact": "Moderate smoke haze is costing roughly 0.5 magnitudes at the zenith, so fainter objects will be harder to pick out.",
+			"dimsView": true
+		}
 	},
 	"targets": {
 		"excellent": [
@@ -254,8 +274,11 @@ that window is genuinely clear:
 - `excellent`: ~85%+ of the night clear
 - `good`: ~65%+ of the night clear
 - `partial`: a real clear window exists, but a meaningful part of the night is clouded (the "clear early, then cloudy" case)
-- `poor`: no genuinely clear window; mostly cloudy
+- `poor`: no genuinely clear window; mostly cloudy — **or** a cloudless night ruined by heavy smoke
 - `unsuitable`: overcast all night or precipitation expected
+
+Aerosols (wildfire smoke, dust) can downgrade quality independently of cloud —
+see [Air Quality & Smoke](#air-quality--smoke).
 
 Fields:
 - `quality` (string): Overall viewing quality (excellent/good/partial/poor/unsuitable)
@@ -272,11 +295,75 @@ Fields:
 - `clearFraction` (number): Fraction of the window that is clear (0-1)
 - `hasRain` (boolean): Whether precipitation is expected
 - `reasons` (array): Human-readable weather factors
+- `verdict` (string): Headline sentence for the night, including any smoke caveat
+- `summary` (string|null): One-liner on how much of the night is clear
+- `airQuality` (object|**optional**): Aerosol and air quality reading — see below
 
 > **Note on 7timer scales:** cloud cover, seeing, and transparency are all
 > reported by 7timer as indices where a **lower number is better**. Earlier
 > versions of this API treated seeing/transparency as "higher is better",
 > which inverted those factors.
+
+### Air Quality & Smoke
+
+`weather.transparencyText` reports the **worse** of 7timer's water-vapour
+transparency and the aerosol load, because 7timer's transparency index does not
+account for wildfire smoke. Before this was added, a smoke-choked Seattle night
+at AOD 0.7 was reported as `"excellent transparency"`.
+
+**Aerosol optical depth (AOD), not AQI, is the metric that matters for
+stargazing.** AOD at 550nm measures how much the whole air column dims and
+scatters starlight; US AQI is a health metric and is a poor proxy for it. A real
+example: Seattle on 2026-08-04 sat at **AQI 56–78 ("moderate")** while **AOD hit
+0.73** — a naive `aqi > 100` threshold would have called that a great night. The
+two are therefore tracked separately and used for different things:
+
+| Signal | Drives | Where it surfaces |
+| --- | --- | --- |
+| AOD | What you can *see* | `quality`, `transparencyText`, `reasons`, `verdict`, target ratings |
+| US AQI | Whether you should *be outside* | `airQuality.healthAdvisory` only |
+
+**AOD levels and their effect on `quality`:**
+
+| AOD | `level` | Effect |
+| --- | --- | --- |
+| < 0.10 | `pristine` | "Exceptional transparency" call-out |
+| 0.10 – 0.20 | `none` | No mention (normal continental background) |
+| 0.20 – 0.35 | `slight` | Mentioned in `reasons`; suppresses any "excellent transparency" claim |
+| 0.35 – 0.55 | `moderate` | Downgrades `excellent` → `good` |
+| 0.55 – 0.90 | `significant` | Downgrades `excellent` → `good`; smoke leads the `verdict` |
+| > 0.90 | `heavy` | Forces `quality` to `poor` and `worthObserving` to `false` |
+
+Rain still outranks smoke: on a `unsuitable`/rainy night no aerosol copy is added.
+
+**Effect on targets.** Extinction at the zenith is `1.086 × AOD` magnitudes (call
+it double that low in the sky). That figure is subtracted from the effective
+faint limit when rating targets, so smoke prunes faint objects — they get
+`bestRating: "too-faint"` with the reason *"Too faint through tonight's haze"*
+and drop out of the results. `viewingCapabilities.maxMagnitude` is deliberately
+**not** modified: it advertises the equipment, not tonight's air.
+
+**Fields (all optional; the whole object is absent if the upstream is
+unreachable):**
+- `aod` (number): Average aerosol optical depth at 550nm across tonight's window
+- `aodPeak` (number): Highest hourly AOD in the window
+- `level` (string): One of `pristine`, `none`, `slight`, `moderate`, `significant`, `heavy`
+- `aerosolType` (string): `smoke`, `dust`, or `haze` — used to name the right thing in copy
+- `extinctionMagnitudes` (number): Magnitudes of dimming at the zenith (`1.086 × aod`)
+- `pm25` (number|null): Average PM2.5 in µg/m³
+- `dust` (number|null): Average dust in µg/m³
+- `usAqi` (number|null): **Peak** US AQI during the window (peak, not average — the worst moment is what matters for health)
+- `healthCategory` (string|null): `good`, `moderate`, `sensitive`, `unhealthy`, `very-unhealthy`, `hazardous`
+- `healthAdvisory` (string|null): Advice for standing outside a couple of hours; `null` below AQI 100 so it does not cry wolf
+- `label` (string|null): Short label, e.g. `"Heavy smoke haze"`
+- `transparencyImpact` (string|null): One sentence on what the aerosols cost you optically
+- `dimsView` (boolean): True when aerosols are dense enough to visibly dim the sky
+
+**Degradation.** Air quality is a *soft* dependency, fetched in parallel with the
+weather with a 5-second timeout. If Open-Meteo is slow, down, or returns no AOD
+for the window, `weather.airQuality` is simply omitted and every other field
+behaves exactly as it did before aerosols were considered. Consumers must treat
+it as optional.
 
 **Target Object:**
 - `name` (string): Celestial body name
@@ -619,6 +706,7 @@ server {
 
 - **Astronomy API** (https://astronomyapi.com) - Celestial body positions and data
 - **7timer Astro** (https://www.7timer.info) - Astronomical weather forecasting
+- **Open-Meteo Air Quality** (https://open-meteo.com/en/docs/air-quality-api) - Aerosol optical depth, PM2.5, dust, and US AQI. Keyless and CAMS-backed; free for non-commercial use up to ~10k calls/day
 - **OpenStreetMap Nominatim** (https://nominatim.openstreetmap.org) - Reverse geocoding for location names
 
 ## Troubleshooting
@@ -627,6 +715,17 @@ server {
 - The API will return an error object in the weather field but continue with target data
 - Check 7timer service status at https://www.7timer.info
 - Weather data is averaged across your viewing window - ensure hours are set correctly
+
+**No `weather.airQuality` in the response**
+- Air quality is a soft dependency — it is omitted rather than erroring
+- Check the logs for `[Air Quality] Unavailable, continuing without it:`
+- Open-Meteo may have been slow (5s timeout), down, or returned no aerosol optical depth for your window
+- Everything else in the response is unaffected; smoke simply is not factored in for that request
+
+**Smoke is present but not reflected in the response**
+- CAMS aerosol data is a model at ~11km resolution and can lag a fast-moving plume by a few hours
+- Check `weather.airQuality.aod` directly: below 0.20 the API deliberately says nothing
+- Note the window matters — smoke often thins overnight, so a smoky afternoon can still average `moderate` over a 9pm–2am window
 
 **Location name shows "Unknown Location"**
 - Geocoding service may be temporarily unavailable
@@ -674,7 +773,10 @@ The API provides comprehensive logging for debugging:
 [Geocoding] Location: Seattle
 [Main] Starting analysis for lat=47.6062, lon=-122.3321, elevation=50, level=naked-eye
 [Weather API] Fetching data for lat=47.6062, lon=-122.3321
+[Air Quality] Fetching aerosol data for lat=47.6062, lon=-122.3321
+[Air Quality] AOD 0.42 (moderate, smoke), US AQI 75
 [Weather] Interpreting conditions for hours 21-2
+[Main] Applying 0.45 mag aerosol extinction penalty to target ratings
 [Astronomy API] Fetching positions for 21:00:00
 [Main] Results: 3 excellent, 2 good, 1 fair targets
 ```
@@ -686,6 +788,7 @@ Log prefixes indicate the component:
 - `[Main]` - Core analysis logic
 - `[Weather API]` - Weather data fetching
 - `[Weather]` - Weather interpretation
+- `[Air Quality]` - Aerosol and air quality fetching/interpretation
 - `[Astronomy API]` - Astronomy data fetching
 
 ## Performance Tips
@@ -705,6 +808,8 @@ Log prefixes indicate the component:
 - **API rate limits**: Free tier of Astronomy API has usage limits
 - **No historical data**: Cannot query past dates
 - **UTC-based calculations**: Evening hours are in local 24-hour format but calculations use UTC
+- **Aerosol data is modelled, not measured**: CAMS runs at ~11km resolution and can lag a fast-moving smoke plume by a few hours. Cross-checking a ground station (AirNow, WAQI) would tighten this
+- **Zenith extinction figure**: `extinctionMagnitudes` is quoted at the zenith; actual loss roughly doubles at 30° altitude and is not computed per-target
 
 ## License
 

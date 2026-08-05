@@ -214,8 +214,273 @@ function isEveningHour(hour, startHour, endHour) {
 	return hour >= startHour || hour <= endHour;
 }
 
-// Weather condition interpretation from 7timer
-function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, longitude, viewingLevel) {
+// ---------------------------------------------------------------------------
+// Air quality / aerosols
+// ---------------------------------------------------------------------------
+// 7timer's transparency index is driven by water vapour aloft and does NOT see
+// wildfire smoke, so a smoke-choked night could still be reported as
+// "excellent transparency". Aerosol optical depth (AOD at 550nm) is the metric
+// that actually matters for stargazing: it measures how much the whole air
+// column dims and scatters starlight.
+//
+// Rough AOD reference points:
+//   < 0.10       pristine
+//   0.10 - 0.20  normal continental background
+//   0.20 - 0.35  visible haze
+//   0.35 - 0.55  moderate smoke/haze
+//   0.55 - 0.90  significant smoke
+//   > 0.90       heavy smoke
+//
+// Note that US AQI is a *health* metric and is a poor proxy for this: a night
+// can sit at AQI 60 ("moderate") while AOD is 0.7 and half the visible stars
+// are gone. The two are tracked separately and used for different things.
+const AOD_LEVELS = [
+	{ max: 0.10, level: 'pristine' },
+	{ max: 0.20, level: 'none' },
+	{ max: 0.35, level: 'slight' },
+	{ max: 0.55, level: 'moderate' },
+	{ max: 0.90, level: 'significant' },
+	{ max: Infinity, level: 'heavy' }
+];
+
+// Levels at which aerosols visibly dim the sky. Below this, saying anything
+// about the air would just be noise.
+const DIMMING_LEVELS = new Set(['slight', 'moderate', 'significant', 'heavy']);
+
+const AIR_QUALITY_TIMEOUT_MS = 5000;
+
+function aodLevel(aod) {
+	return AOD_LEVELS.find(entry => aod < entry.max).level;
+}
+
+// Extinction at the zenith for a given optical depth:
+//   dm = 2.5 * log10(e^tau) = 1.086 * tau   (per unit airmass)
+// Low in the sky this roughly doubles, but the zenith figure is the honest
+// headline number.
+function aodToMagnitudes(aod) {
+	return 1.086 * aod;
+}
+
+// Distinguish smoke from blown dust so the copy can name the right thing.
+function aerosolType(pm25, dust) {
+	if (dust !== null && dust >= 20 && (pm25 === null || dust > pm25)) return 'dust';
+	if (pm25 !== null && pm25 >= 12) return 'smoke';
+	return 'haze';
+}
+
+// Short label, e.g. "Heavy smoke haze". Null when there is nothing to report.
+function aerosolLabel(level, type) {
+	const phrase = type === 'haze' ? 'haze' : `${type} haze`;
+	switch (level) {
+		case 'pristine': return 'Exceptionally clear air';
+		case 'none': return null;
+		case 'slight': return `Slight ${phrase}`;
+		case 'moderate': return `Moderate ${phrase}`;
+		case 'significant': return `Heavy ${phrase}`;
+		case 'heavy': return `Very heavy ${type === 'haze' ? 'haze' : type}`;
+		default: return null;
+	}
+}
+
+// One sentence on what the aerosol load does to the view.
+function buildTransparencyImpact(level, type, magnitudes) {
+	const noun = type === 'haze' ? 'haze' : type;
+	const dimming = magnitudes.toFixed(1);
+	switch (level) {
+		case 'pristine':
+			return 'Exceptionally transparent air tonight — faint objects should show well.';
+		case 'none':
+			return null;
+		case 'slight':
+			return `A little ${noun} in the air, costing roughly ${dimming} magnitudes — barely noticeable.`;
+		case 'moderate':
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith, so fainter objects will be harder to pick out.`;
+		case 'significant':
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith — expect fainter stars to be washed out, though the Moon and bright planets cut through fine.`;
+		case 'heavy':
+			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes at the zenith and more low in the sky, washing out all but the brightest objects.`;
+		default:
+			return null;
+	}
+}
+
+// Standard US AQI breakpoints.
+function usAqiCategory(aqi) {
+	if (aqi <= 50) return 'good';
+	if (aqi <= 100) return 'moderate';
+	if (aqi <= 150) return 'sensitive';
+	if (aqi <= 200) return 'unhealthy';
+	if (aqi <= 300) return 'very-unhealthy';
+	return 'hazardous';
+}
+
+// Health advice framed for the actual activity: standing outside for a couple
+// of hours. Deliberately silent below AQI 100 so it does not cry wolf.
+function buildHealthAdvisory(category, aqi) {
+	switch (category) {
+		case 'good':
+		case 'moderate':
+			return null;
+		case 'sensitive':
+			return `Air quality is unhealthy for sensitive groups (AQI ${aqi}) — go easy if smoke bothers you.`;
+		case 'unhealthy':
+			return `Air quality is unhealthy (AQI ${aqi}) — keep the session short or wear a mask.`;
+		case 'very-unhealthy':
+			return `Air quality is very unhealthy (AQI ${aqi}) — better to sit this one out.`;
+		case 'hazardous':
+			return `Air quality is hazardous (AQI ${aqi}) — stay inside tonight.`;
+		default:
+			return null;
+	}
+}
+
+// Minimal JSON GET with a timeout. Kept separate from getWeatherConditions so
+// that its retry behaviour is untouched.
+function fetchJson(urlString, timeoutMs) {
+	return new Promise((resolve, reject) => {
+		const parsedUrl = url.parse(urlString);
+
+		const req = https.get({
+			hostname: parsedUrl.hostname,
+			path: parsedUrl.path,
+			method: 'GET'
+		}, (res) => {
+			let data = '';
+			res.on('data', (chunk) => {
+				data += chunk;
+			});
+			res.on('end', () => {
+				if (res.statusCode !== 200) {
+					reject(new Error(`Request failed with status ${res.statusCode}`));
+					return;
+				}
+				try {
+					resolve(JSON.parse(data));
+				} catch (parseError) {
+					reject(new Error('Response was not valid JSON'));
+				}
+			});
+		});
+
+		req.on('error', reject);
+		req.setTimeout(timeoutMs, () => {
+			req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+		});
+	});
+}
+
+// Open-Meteo's air quality API: no key, no registration, CAMS-backed, global.
+// This is a SOFT dependency -- a smoke reading is a bonus, never a reason to
+// fail the whole response. Callers treat null as "no aerosol information".
+async function getAirQuality(latitude, longitude) {
+	const apiUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?` +
+		`latitude=${latitude}&longitude=${longitude}` +
+		`&hourly=pm2_5,us_aqi,aerosol_optical_depth,dust` +
+		`&timezone=auto&forecast_days=2`;
+
+	try {
+		console.log(`[Air Quality] Fetching aerosol data for lat=${latitude}, lon=${longitude}`);
+		const data = await fetchJson(apiUrl, AIR_QUALITY_TIMEOUT_MS);
+		console.log('[Air Quality] Successfully retrieved aerosol data');
+		return data;
+	} catch (error) {
+		console.error('[Air Quality] Unavailable, continuing without it:', error.message);
+		return null;
+	}
+}
+
+// Open-Meteo returns a contiguous hourly series in local time (timezone=auto),
+// so tonight's window is just a run of indices starting at the first entry
+// whose hour matches eveningStartHour.
+function selectEveningIndices(times, startHour, endHour) {
+	const hourAt = i => parseInt(String(times[i]).slice(11, 13), 10);
+
+	let startIndex = -1;
+	for (let i = 0; i < times.length; i++) {
+		if (hourAt(i) === startHour) {
+			startIndex = i;
+			break;
+		}
+	}
+	if (startIndex === -1) return [];
+
+	const crossesMidnight = endHour <= startHour;
+	const span = crossesMidnight
+		? (24 - startHour) + endHour + 1
+		: (endHour - startHour) + 1;
+
+	const indices = [];
+	for (let i = startIndex; i < Math.min(times.length, startIndex + span); i++) {
+		indices.push(i);
+	}
+	return indices;
+}
+
+// Reduce the hourly aerosol series down to tonight's viewing window.
+function interpretAirQuality(data, eveningStartHour, eveningEndHour) {
+	if (!data || !data.hourly || !Array.isArray(data.hourly.time)) {
+		return null;
+	}
+
+	const hourly = data.hourly;
+	const indices = selectEveningIndices(hourly.time, eveningStartHour, eveningEndHour);
+	if (indices.length === 0) {
+		console.log('[Air Quality] No hours matched tonight\'s window');
+		return null;
+	}
+
+	const pick = series => indices
+		.map(i => Array.isArray(series) ? series[i] : undefined)
+		.filter(v => typeof v === 'number' && !isNaN(v));
+
+	const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+	const peak = arr => arr.length ? Math.max(...arr) : null;
+
+	const aodValues = pick(hourly.aerosol_optical_depth);
+	if (aodValues.length === 0) {
+		// Without AOD there is nothing here worth reporting.
+		console.log('[Air Quality] No aerosol optical depth values for tonight');
+		return null;
+	}
+
+	const aod = avg(aodValues);
+	const aodPeak = peak(aodValues);
+	const pm25 = avg(pick(hourly.pm2_5));
+	const dust = avg(pick(hourly.dust));
+	const usAqi = peak(pick(hourly.us_aqi));
+
+	const level = aodLevel(aod);
+	const type = aerosolType(pm25, dust);
+	const extinctionMagnitudes = aodToMagnitudes(aod);
+	const healthCategory = usAqi !== null ? usAqiCategory(usAqi) : null;
+
+	const round = (value, places) => value === null
+		? null
+		: parseFloat(value.toFixed(places));
+
+	console.log(`[Air Quality] AOD ${aod.toFixed(2)} (${level}, ${type}), US AQI ${usAqi ?? 'n/a'}`);
+
+	return {
+		aod: round(aod, 2),
+		aodPeak: round(aodPeak, 2),
+		level,
+		aerosolType: type,
+		extinctionMagnitudes: round(extinctionMagnitudes, 2),
+		pm25: round(pm25, 1),
+		dust: round(dust, 1),
+		usAqi: usAqi === null ? null : Math.round(usAqi),
+		healthCategory,
+		healthAdvisory: healthCategory ? buildHealthAdvisory(healthCategory, Math.round(usAqi)) : null,
+		label: aerosolLabel(level, type),
+		transparencyImpact: buildTransparencyImpact(level, type, extinctionMagnitudes),
+		dimsView: DIMMING_LEVELS.has(level)
+	};
+}
+
+// Weather condition interpretation from 7timer. `air` is the optional output of
+// interpretAirQuality; when absent, behaviour is exactly as it was before
+// aerosols were considered.
+function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, longitude, viewingLevel, air = null) {
 	console.log(`[Weather] Interpreting conditions for local hours ${eveningStartHour}-${eveningEndHour}`);
 
 	if (!data || !Array.isArray(data.dataseries) || data.dataseries.length === 0) {
@@ -364,8 +629,32 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		if (avgTransparency >= 6) {
 			reasons.push('some haze');
 			if (quality === 'excellent') quality = 'good';
-		} else if (avgTransparency <= 3) {
+		} else if (avgTransparency <= 3 && !(air && air.dimsView)) {
+			// Only claim excellent transparency when the aerosol load agrees.
+			// 7timer's index misses wildfire smoke entirely, so on its own it
+			// will happily call a smoke-filled sky "excellent".
 			reasons.push('excellent transparency');
+		}
+
+		// Aerosols are a separate story from water vapour and get their own say.
+		if (air && air.dimsView) {
+			reasons.push(air.label.toLowerCase());
+			if ((air.level === 'moderate' || air.level === 'significant') && quality === 'excellent') {
+				quality = 'good';
+				score = 1;
+			}
+		}
+	}
+
+	// Heavy smoke washes out all but the brightest objects no matter how clear
+	// the sky is, so it can sink an otherwise fine night on its own. Rain still
+	// outranks it -- no point telling someone about smoke in a downpour.
+	if (air && air.level === 'heavy' && quality !== 'unsuitable') {
+		quality = 'poor';
+		worthObserving = false;
+		score = Math.max(score, 3);
+		if (!reasons.includes(air.label.toLowerCase())) {
+			reasons.push(air.label.toLowerCase());
 		}
 	}
 
@@ -380,13 +669,19 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		avgTransparency: parseFloat(avgTransparency.toFixed(1)),
 		cloudCoverPct: cloudIndexToPct(avgCloudCover),
 		seeingText: qualityWord(avgSeeing),
-		transparencyText: qualityWord(avgTransparency),
+		transparencyText: aerosolAwareTransparency(avgTransparency, air),
 		clearHours,
 		nightHours,
 		clearFraction: parseFloat(clearFraction.toFixed(2)),
 		hasRain,
 		reasons
 	};
+
+	// Additive: absent when the air quality upstream was unreachable, so every
+	// consumer must treat it as optional.
+	if (air) {
+		result.airQuality = air;
+	}
 
 	// Add viewing windows if any exist. The "best" window is the longest one,
 	// tie-broken by lowest average cloud cover.
@@ -402,37 +697,96 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 
 	// Human-friendly copy, computed once here so every surface (web, iOS,
 	// TRMNL) renders consistent language without re-deriving it.
-	result.verdict = buildVerdict(quality, hasRain, result.bestWindow, viewingLevel);
+	result.verdict = buildVerdict(quality, hasRain, result.bestWindow, viewingLevel, air);
 	result.summary = buildClearSummary(clearHours, nightHours, clearFraction);
 
 	return result;
 }
 
+// Report the worse of 7timer's water-vapour transparency and the aerosol load,
+// so smoke can never be papered over by a clear-but-hazy forecast.
+function aerosolAwareTransparency(avgTransparency, air) {
+	const base = qualityWord(avgTransparency);
+	if (!air) return base;
+
+	const aerosolCap = {
+		pristine: 'excellent',
+		none: 'excellent',
+		slight: 'good',
+		moderate: 'fair',
+		significant: 'poor',
+		heavy: 'poor'
+	}[air.level];
+	if (!aerosolCap) return base;
+
+	const order = ['excellent', 'good', 'fair', 'poor'];
+	return order[Math.max(order.indexOf(base), order.indexOf(aerosolCap))];
+}
+
+// Extra sentence appended to the headline when the air is what decides the
+// night. Silent when aerosols are not the story.
+function buildAerosolClause(air, quality) {
+	// Rain already told the user not to bother.
+	if (quality === 'unsuitable') return null;
+
+	switch (air.level) {
+		case 'heavy':
+			return `${air.label} is washing the sky out — worth saving for a clearer night.`;
+		case 'significant':
+			return `${air.label} will wash out fainter stars, though the Moon and bright planets still cut through.`;
+		case 'moderate':
+			return `${air.label} is taking the edge off — fainter objects will be harder to pick out.`;
+		default:
+			return null;
+	}
+}
+
 // Plain-language headline verdict for the night. Copy adapts to the viewing
 // level so naked-eye observers don't get telescope-specific wording.
-function buildVerdict(quality, hasRain, bestWindow, viewingLevel) {
+function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 	const usesTelescope = viewingLevel && viewingLevel !== 'naked-eye';
+
+	// When the air is what decides the night, lead with it rather than implying
+	// cloud -- the sky may well be cloudless. Otherwise "A good night for
+	// stargazing" ends up sitting next to "heavy smoke haze", which reads badly
+	// even though both halves are true.
+	if (air && air.level === 'heavy' && quality === 'poor') {
+		return `${air.label} tonight — the sky may be clear, but it is washed out. Worth waiting for cleaner air.`;
+	}
+	if (air && air.level === 'significant' && (quality === 'excellent' || quality === 'good')) {
+		return `Clear skies, but ${air.label.toLowerCase()} will wash out fainter stars — the Moon and bright planets still look good.`;
+	}
+
+	let headline;
 	switch (quality) {
 		case 'excellent':
-			return 'Great night for stargazing!';
+			headline = 'Great night for stargazing!';
+			break;
 		case 'good':
-			return 'A good night for stargazing.';
+			headline = 'A good night for stargazing.';
+			break;
 		case 'partial':
-			return bestWindow
+			headline = bestWindow
 				? `Your clear window is ${bestWindow.startTime}–${bestWindow.endTime}; mostly cloudy otherwise.`
 				: 'A short clear window tonight, then mostly cloudy.';
+			break;
 		case 'unsuitable':
 			if (hasRain) {
-				return usesTelescope
+				headline = usesTelescope
 					? 'Rain expected — not a night for the telescope.'
 					: 'Rain expected — not a night for stargazing.';
+			} else {
+				headline = usesTelescope
+					? 'Clouded out — not worth setting up tonight.'
+					: 'Clouded out — not worth heading out tonight.';
 			}
-			return usesTelescope
-				? 'Clouded out — not worth setting up tonight.'
-				: 'Clouded out — not worth heading out tonight.';
+			break;
 		default:
-			return 'Mostly cloudy tonight — not ideal for stargazing.';
+			headline = 'Mostly cloudy tonight — not ideal for stargazing.';
 	}
+
+	const aerosolClause = air ? buildAerosolClause(air, quality) : null;
+	return aerosolClause ? `${headline} ${aerosolClause}` : headline;
 }
 
 // One-line summary of how much of the night is actually clear.
@@ -511,14 +865,22 @@ async function getWeatherConditions(latitude, longitude, retries = 2) {
 	}
 }
 
-// Rating criteria for viewing quality
-function getViewingRating(body, viewingCaps, viewingLevel) {
+// Rating criteria for viewing quality. `magnitudePenalty` is tonight's aerosol
+// extinction: it raises the effective faint limit without touching the
+// advertised viewingCapabilities, which describe the gear rather than the air
+// (and whose maxMagnitude consumers decode as an integer).
+function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0) {
 	const altitude = parseFloat(body.position.horizontal.altitude.degrees);
 	const magnitude = body.extraInfo.magnitude;
+	const faintLimit = viewingCaps.maxMagnitude - magnitudePenalty;
 
 	if (altitude < 0) return { rating: 'not-visible', reason: 'Below horizon' };
 	if (altitude < viewingCaps.minAltitude) return { rating: 'poor', reason: 'Too low on horizon' };
-	if (magnitude !== null && magnitude > viewingCaps.maxMagnitude) {
+	if (magnitude !== null && magnitude > faintLimit) {
+		// Distinguish "your gear cannot" from "tonight's air cannot".
+		if (magnitudePenalty > 0 && magnitude <= viewingCaps.maxMagnitude) {
+			return { rating: 'too-faint', reason: 'Too faint through tonight\'s haze' };
+		}
 		return { rating: 'too-faint', reason: `Too faint for ${viewingLevel === 'naked-eye' ? 'naked eye' : 'your telescope'}` };
 	}
 
@@ -596,7 +958,7 @@ function getCurrentDate() {
 }
 
 // Analyze targets for a specific time
-async function analyzeTargets(date, time, latitude, longitude, elevation, viewingLevel) {
+async function analyzeTargets(date, time, latitude, longitude, elevation, viewingLevel, magnitudePenalty = 0) {
 	const apiUrl = `https://api.astronomyapi.com/api/v2/bodies/positions?` +
 		`latitude=${latitude}&longitude=${longitude}&elevation=${elevation}` +
 		`&from_date=${date}&to_date=${date}&time=${time}`;
@@ -613,7 +975,7 @@ async function analyzeTargets(date, time, latitude, longitude, elevation, viewin
 
 			if (body.id === 'sun' || body.id === 'earth') continue;
 
-			const viewingInfo = getViewingRating(body, viewingCaps, viewingLevel);
+			const viewingInfo = getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty);
 
 			results.push({
 				name: body.name,
@@ -698,16 +1060,30 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 		}
 	};
 
-	// Get weather conditions
+	// Get weather conditions. Air quality is fetched alongside it (and never
+	// throws), so a smoke reading costs no extra wall-clock time and its absence
+	// leaves the weather interpretation exactly as it was before.
+	let air = null;
 	try {
-		const weatherData = await getWeatherConditions(latitude, longitude);
-		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour, longitude, viewingLevel);
+		const [weatherData, airData] = await Promise.all([
+			getWeatherConditions(latitude, longitude),
+			getAirQuality(latitude, longitude)
+		]);
+		air = interpretAirQuality(airData, eveningStartHour, eveningEndHour);
+		result.weather = interpretWeatherConditions(weatherData, eveningStartHour, eveningEndHour, longitude, viewingLevel, air);
 	} catch (error) {
 		console.error('[Main] Weather data error:', error.message);
 		result.weather = {
 			error: 'Weather data unavailable',
 			message: error.message
 		};
+	}
+
+	// Smoke raises the effective faint limit, so targets are re-rated against
+	// tonight's air rather than the gear's nominal reach.
+	const magnitudePenalty = air ? air.extinctionMagnitudes : 0;
+	if (magnitudePenalty > 0) {
+		console.log(`[Main] Applying ${magnitudePenalty} mag aerosol extinction penalty to target ratings`);
 	}
 
 	// Generate hours to check
@@ -729,7 +1105,7 @@ async function getViewingData(latitude, longitude, elevation, viewingLevel, even
 		const time = formatTime(hour);
 
 		try {
-			const targets = await analyzeTargets(date, time, latitude, longitude, elevation, viewingLevel);
+			const targets = await analyzeTargets(date, time, latitude, longitude, elevation, viewingLevel, magnitudePenalty);
 
 			for (const target of targets) {
 				if (!targetsByName.has(target.name)) {
@@ -1029,5 +1405,11 @@ module.exports = {
 	interpretWeatherConditions,
 	approxUtcOffset,
 	cloudIndexToPct,
-	qualityWord
+	qualityWord,
+	interpretAirQuality,
+	aerosolAwareTransparency,
+	aodLevel,
+	aodToMagnitudes,
+	usAqiCategory,
+	getAirQuality
 };
