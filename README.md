@@ -159,23 +159,45 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 			"steady atmosphere",
 			"moderate smoke haze"
 		],
-		"verdict": "A good night for stargazing. Moderate smoke haze is taking the edge off — fainter objects will be harder to pick out.",
+		"verdict": "A good night for stargazing. Moderate smoke haze is taking the edge off, especially low in the sky.",
 		"summary": "Clear skies the entire night.",
 		"airQuality": {
-			"aod": 0.42,
-			"aodPeak": 0.47,
+			"aod": 0.34,
+			"aodPeak": 0.36,
 			"level": "moderate",
 			"aerosolType": "smoke",
-			"extinctionMagnitudes": 0.45,
-			"pm25": 20.9,
-			"dust": 0,
-			"usAqi": 75,
-			"healthCategory": "moderate",
-			"healthAdvisory": null,
+			"extinctionMagnitudes": 0.37,
+			"pm25": 41.6,
+			"dust": 1,
+			"usAqi": 152,
+			"healthCategory": "unhealthy",
+			"healthAdvisory": "Air quality is unhealthy (AQI 152) — keep the session short or wear a mask.",
 			"label": "Moderate smoke haze",
-			"transparencyImpact": "Moderate smoke haze is costing roughly 0.5 magnitudes at the zenith, so fainter objects will be harder to pick out.",
-			"dimsView": true
-		}
+			"transparencyImpact": "Moderate smoke haze is costing roughly 0.4 magnitudes overhead and about 1.1 low in the sky, so fainter objects will be harder to pick out near the horizon.",
+			"dimsView": true,
+			"dominatesView": false
+		},
+		"display": {
+			"heading": "Good Conditions",
+			"targetsHeading": "What to Look For Tonight",
+			"severity": "caution",
+			"severityRank": 2,
+			"icon": "star"
+		},
+		"notices": [
+			{
+				"kind": "aerosol",
+				"severity": "caution",
+				"icon": "smoke",
+				"text": "Moderate smoke haze is costing roughly 0.4 magnitudes overhead and about 1.1 low in the sky, so fainter objects will be harder to pick out near the horizon."
+			},
+			{
+				"kind": "health",
+				"severity": "warning",
+				"icon": "health",
+				"text": "Air quality is unhealthy (AQI 152) — keep the session short or wear a mask."
+			}
+		]
 	},
 	"targets": {
 		"excellent": [
@@ -298,6 +320,8 @@ Fields:
 - `verdict` (string): Headline sentence for the night, including any smoke caveat
 - `summary` (string|null): One-liner on how much of the night is clear
 - `airQuality` (object|**optional**): Aerosol and air quality reading — see below
+- `display` (object): Presentation directives — heading, severity, icon. See [Presentation Directives](#presentation-directives-weatherdisplay-weathernotices)
+- `notices` (array): Ordered advisories to render generically. Empty array when there is nothing to flag
 
 > **Note on 7timer scales:** cloud cover, seeing, and transparency are all
 > reported by 7timer as indices where a **lower number is better**. Earlier
@@ -395,6 +419,7 @@ unreachable):**
 - `label` (string|null): Short label, e.g. `"Heavy smoke haze"`
 - `transparencyImpact` (string|null): One sentence on what the aerosols cost you optically
 - `dimsView` (boolean): True when aerosols are dense enough to visibly dim the sky
+- `dominatesView` (boolean): True when the AIR, not cloud, is what limits the night. **Prefer this over testing `level` against string literals** — retuning the tiers then needs no client release
 
 **Degradation.** Air quality is a *soft* dependency, fetched in parallel with the
 weather with a 5-second timeout. If Open-Meteo is slow, down, or returns no AOD
@@ -419,6 +444,85 @@ it as optional.
 	- `value` (number): Numeric distance value
 	- `unit` (string): Unit of measurement (light-seconds, light-minutes, light-hours, light-days, light-years)
 	- `string` (string): Human-readable distance (e.g., "8.32 light minutes away")
+
+### Presentation Directives (`weather.display`, `weather.notices`)
+
+**The point of these fields is that retuning the weather model should not require
+releasing the apps.** For the iOS app in particular, a client change means pulling
+the build from review and taking a new place in the queue, so anything the clients
+decide for themselves is a change that costs a review cycle.
+
+**The contract.** The API owns every piece of user-visible text and every severity
+decision. Clients own exactly two lookup tables, and nothing else:
+
+| Client owns | Entries | Changes when |
+| --- | --- | --- |
+| `severity` → colour | 5 | Never (closed vocabulary) |
+| `icon` token → glyph/asset | ~8 | Only if a genuinely new *depiction* is needed |
+
+`severity` is deliberately **presentation-level**: it says how alarmed to look,
+not what is meteorologically wrong. That is why adding a `quality` value or
+retuning an aerosol tier changes only *which* severity is emitted, never the
+vocabulary itself — so no client needs rebuilding.
+
+```json
+"weather": {
+  "display": {
+    "heading": "Partial Conditions",
+    "targetsHeading": "What to Look For High Overhead",
+    "severity": "warning",
+    "severityRank": 3,
+    "icon": "smoke"
+  },
+  "notices": [
+    { "kind": "aerosol", "severity": "warning", "icon": "smoke",  "text": "..." },
+    { "kind": "health",  "severity": "caution", "icon": "health", "text": "..." }
+  ]
+}
+```
+
+**`display` fields:**
+- `heading` (string): Card heading, rendered verbatim
+- `targetsHeading` (string): Heading for the targets list, rendered verbatim
+- `severity` (string): `positive` | `neutral` | `caution` | `warning` | `critical`
+- `severityRank` (number): 0–4, ordered by increasing alarm. Lets a client place an
+  unrecognised severity on the scale instead of guessing
+- `icon` (string): Token naming what to *depict* — `sparkles`, `star`,
+  `partly-cloudy`, `cloudy`, `rain`, `smoke`, `dust`
+
+**`notices`** is an ordered array of advisories, each `{ kind, severity, icon, text }`.
+**Clients must loop this blindly rather than reading named fields.** That is what
+makes it possible to add an advisory (moon washout, wind, dew point) and have it
+appear on every surface with no client work. `kind` is informational only — never
+switch on it.
+
+#### Rules for consumers
+
+1. **Never** switch on `quality` or `airQuality.level` for styling. Use
+   `display.severity` and `display.icon`.
+2. **Never** construct user-visible text. Use `display.heading`,
+   `display.targetsHeading`, `verdict`, `summary`, and `notices[].text`.
+3. Use `airQuality.dominatesView` rather than testing `level` against
+   `"significant"`/`"heavy"`.
+4. Use `worthObserving` — not severity — for "should I go out?" affordances. A
+   smoke-hazed `partial` night and a clouded-out `poor` night are both severity
+   `warning`, but only one is worth going out for.
+5. Fall back gracefully: an unrecognised `severity` must resolve to **neutral**,
+   never to the most alarming colour.
+
+#### Backward and forward compatibility
+
+Both directions are safe, so the API and the apps can be deployed independently
+and in any order:
+
+- **Old client, new API** — the extra fields are ignored and the client keeps
+  deriving its own styling from `quality`.
+- **New client, old API** — `display` and `notices` are absent, and each client
+  falls back to its previous local derivation.
+
+The iOS app, web app, and TRMNL template all implement the fallback path, and the
+TRMNL template has been verified to render byte-identical output against responses
+with and without the directives.
 
 ### Error Responses
 

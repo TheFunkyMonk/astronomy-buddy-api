@@ -248,6 +248,11 @@ const AOD_LEVELS = [
 // about the air would just be noise.
 const DIMMING_LEVELS = new Set(['slight', 'moderate', 'significant', 'heavy']);
 
+// Levels at which the AIR, not cloud, is the limiting factor for the night --
+// the point where copy should talk about altitude rather than timing. Surfaced
+// as `airQuality.dominatesView` so clients never hardcode these level names.
+const DOMINATING_LEVELS = new Set(['significant', 'heavy']);
+
 const AIR_QUALITY_TIMEOUT_MS = 5000;
 
 function aodLevel(aod) {
@@ -505,7 +510,11 @@ function interpretAirQuality(data, eveningStartHour, eveningEndHour) {
 		healthAdvisory: healthCategory ? buildHealthAdvisory(healthCategory, Math.round(usAqi)) : null,
 		label: aerosolLabel(level, type),
 		transparencyImpact: buildTransparencyImpact(level, type, extinctionMagnitudes),
-		dimsView: DIMMING_LEVELS.has(level)
+		dimsView: DIMMING_LEVELS.has(level),
+		// True when aerosols, not cloud, are what limit the night. Clients should
+		// branch on THIS rather than testing `level` against string literals, so
+		// that retuning the tiers never requires a client release.
+		dominatesView: DOMINATING_LEVELS.has(level)
 	};
 }
 
@@ -741,6 +750,19 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 	result.verdict = buildVerdict(quality, hasRain, result.bestWindow, viewingLevel, air);
 	result.summary = buildClearSummary(clearHours, nightHours, clearFraction);
 
+	// Presentation directives. Additive: older clients ignore these and keep
+	// deriving their own styling from `quality`, so this can ship to production
+	// ahead of any app update.
+	const severity = buildSeverity(quality, air);
+	result.display = {
+		heading: buildHeading(quality),
+		targetsHeading: buildTargetsHeading(quality, worthObserving, air),
+		severity,
+		severityRank: severityRank(severity),
+		icon: buildIcon(quality, air)
+	};
+	result.notices = buildNotices(air, quality);
+
 	return result;
 }
 
@@ -833,6 +855,144 @@ function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 
 	const aerosolClause = air ? buildAerosolClause(air, quality) : null;
 	return aerosolClause ? `${headline} ${aerosolClause}` : headline;
+}
+
+// ---------------------------------------------------------------------------
+// Presentation directives
+// ---------------------------------------------------------------------------
+// Everything below exists so that tuning the weather model does not require
+// rebuilding the client apps -- which for iOS means a new App Store review.
+//
+// The contract: the API owns all user-visible text and every severity decision.
+// Clients own exactly two lookup tables, both of which are stable:
+//   severity -> colour        (5 entries, below)
+//   icon token -> glyph/asset (a handful of entries)
+//
+// `severity` is deliberately about HOW ALARMED TO LOOK rather than what is
+// wrong, so it does not need to change when the domain model does. Adding a new
+// `quality` value or aerosol tier changes only which severity is emitted, not
+// the vocabulary itself.
+const SEVERITY_RANKS = {
+	positive: 0,
+	neutral: 1,
+	caution: 2,
+	warning: 3,
+	critical: 4
+};
+
+// Icon tokens name what they DEPICT, so each surface can map them to its own
+// asset (SF Symbol, emoji, e-ink PNG) without knowing anything about weather.
+const QUALITY_ICONS = {
+	excellent: 'sparkles',
+	good: 'star',
+	partial: 'partly-cloudy',
+	poor: 'cloudy',
+	unsuitable: 'rain'
+};
+
+const QUALITY_SEVERITIES = {
+	excellent: 'positive',
+	good: 'positive',
+	partial: 'caution',
+	poor: 'warning',
+	unsuitable: 'critical'
+};
+
+function severityRank(severity) {
+	return SEVERITY_RANKS[severity] !== undefined ? SEVERITY_RANKS[severity] : SEVERITY_RANKS.neutral;
+}
+
+function worseSeverity(a, b) {
+	return severityRank(a) >= severityRank(b) ? a : b;
+}
+
+// Headline severity for the night, escalated when aerosols outrank the cloud
+// story. Without the escalation a smoke-hazed night the model still calls "good"
+// would render bright green next to a smoke warning.
+function buildSeverity(quality, air) {
+	let severity = QUALITY_SEVERITIES[quality] || 'neutral';
+	if (!air || !air.dimsView) return severity;
+
+	if (air.level === 'heavy') {
+		severity = worseSeverity(severity, 'critical');
+	} else if (air.level === 'significant') {
+		severity = worseSeverity(severity, 'warning');
+	} else if (air.level === 'moderate') {
+		severity = worseSeverity(severity, 'caution');
+	}
+	return severity;
+}
+
+// Icon for the night. Aerosols take over the icon once they, not cloud, are the
+// limiting factor -- a cloud glyph on a cloudless smoky night is just wrong.
+// Rain still outranks smoke, matching buildVerdict: a smoke glyph on a rained-out
+// night is equally wrong.
+function buildIcon(quality, air) {
+	if (quality !== 'unsuitable' && air && air.dominatesView) {
+		return air.aerosolType === 'dust' ? 'dust' : 'smoke';
+	}
+	return QUALITY_ICONS[quality] || 'partly-cloudy';
+}
+
+function buildHeading(quality) {
+	const known = QUALITY_SEVERITIES[quality] !== undefined;
+	const word = known ? quality : 'unknown';
+	return `${word.charAt(0).toUpperCase()}${word.slice(1)} Conditions`;
+}
+
+// Heading for the targets list. On a smoke-limited night it is altitude, not
+// timing, that constrains you, so the clear-window wording would mislead.
+function buildTargetsHeading(quality, worthObserving, air) {
+	// Rain outranks smoke here too -- see buildIcon.
+	if (quality !== 'unsuitable' && air && air.dominatesView) {
+		return worthObserving
+			? 'What to Look For High Overhead'
+			: 'Best Positioned Objects (Despite the Smoke)';
+	}
+	if (quality === 'partial') {
+		return 'What to Look For During Clear Windows';
+	}
+	return worthObserving
+		? 'What to Look For Tonight'
+		: 'Best Positioned Objects (Despite Conditions)';
+}
+
+// A generic, ordered list of advisories. This is the field that buys the most
+// future freedom: any new advisory added here (moon washout, wind, dew point)
+// renders on every surface with no client change, because clients loop it
+// blindly rather than reading named fields.
+function buildNotices(air, quality) {
+	const notices = [];
+	if (!air) return notices;
+
+	// What smoke costs you optically is irrelevant in a downpour, but the health
+	// reading still matters if you step outside at all -- so only the aerosol
+	// notice is suppressed.
+	if (quality !== 'unsuitable' && air.dimsView && air.transparencyImpact) {
+		notices.push({
+			kind: 'aerosol',
+			severity: buildSeverity('excellent', air) === 'positive' ? 'neutral' : buildSeverity('excellent', air),
+			icon: air.aerosolType === 'dust' ? 'dust' : 'smoke',
+			text: air.transparencyImpact
+		});
+	}
+
+	if (air.healthAdvisory) {
+		const healthSeverity = {
+			sensitive: 'caution',
+			unhealthy: 'warning',
+			'very-unhealthy': 'critical',
+			hazardous: 'critical'
+		}[air.healthCategory] || 'caution';
+		notices.push({
+			kind: 'health',
+			severity: healthSeverity,
+			icon: 'health',
+			text: air.healthAdvisory
+		});
+	}
+
+	return notices;
 }
 
 // One-line summary of how much of the night is actually clear.
@@ -1480,5 +1640,11 @@ module.exports = {
 	extinctionAtAltitude,
 	getViewingRating,
 	usAqiCategory,
-	getAirQuality
+	getAirQuality,
+	buildSeverity,
+	buildIcon,
+	buildHeading,
+	buildTargetsHeading,
+	buildNotices,
+	severityRank
 };
