@@ -215,6 +215,44 @@ function isEveningHour(hour, startHour, endHour) {
 }
 
 // ---------------------------------------------------------------------------
+// Copy length budgets
+// ---------------------------------------------------------------------------
+// Every user-visible string is authored to fit a fixed character budget, because
+// the narrowest surface -- the TRMNL e-ink dashboard -- has no scroll and no
+// ellipsis: copy that overruns is simply lost off the edge of the panel. The
+// budgets below were sized against that panel's description column (roughly 28
+// characters per line) and are deliberately tight enough to be scannable at a
+// glance on every surface.
+//
+// The rule is one idea per field: `verdict` says what kind of night it is,
+// `summary` says how much of it is clear, and `notices` carry the detail. None
+// of them restates another, so the surfaces never stack three sentences that
+// say the same thing.
+const COPY_LIMITS = {
+	heading: 32,
+	verdict: 90,
+	summary: 48,
+	notice: 90,
+	// Per-target reasons are the one field built by appending clauses (angle,
+	// brightness, haze), so this is budgeted for the worst legitimate
+	// combination of all three rather than for a single phrase.
+	reason: 64
+};
+
+// Guardrail, not a formatter. The authored copy already fits, so this should
+// never fire in production -- it exists so that a future phrasing change cannot
+// silently ship an overflowing string, and it logs loudly when it does.
+function fitCopy(text, limit, field) {
+	if (typeof text !== 'string' || text.length <= limit) return text;
+
+	console.warn(`[Copy] ${field} ran to ${text.length} chars (budget ${limit}), trimming: ${text}`);
+	const clipped = text.slice(0, limit - 1);
+	const lastSpace = clipped.lastIndexOf(' ');
+	const body = lastSpace > limit / 2 ? clipped.slice(0, lastSpace) : clipped;
+	return `${body.replace(/[\s,;:.\u2014-]+$/, '')}\u2026`;
+}
+
+// ---------------------------------------------------------------------------
 // Air quality / aerosols
 // ---------------------------------------------------------------------------
 // 7timer's transparency index is driven by water vapour aloft and does NOT see
@@ -312,6 +350,15 @@ function aerosolLabel(level, type) {
 	}
 }
 
+// Sentence-leading noun for the aerosol at hand -- "Smoke", "Dust" or "Haze".
+// Short copy leans on this instead of the full label, because the label is
+// already surfaced separately as `airQuality.label` and as the notice icon.
+function aerosolNoun(type) {
+	if (type === 'dust') return 'Dust';
+	if (type === 'smoke') return 'Smoke';
+	return 'Haze';
+}
+
 // One sentence on what the aerosol load does to the view. Quotes BOTH the zenith
 // figure and the figure low in the sky: the zenith number alone badly understates
 // what an observer experiences, because most disappointing targets are the low
@@ -320,25 +367,31 @@ function aerosolLabel(level, type) {
 const LOW_ALTITUDE_REFERENCE = 20;
 
 function buildTransparencyImpact(level, type, magnitudes) {
-	const noun = type === 'haze' ? 'haze' : type;
+	const noun = aerosolNoun(type);
 	const dimming = magnitudes.toFixed(1);
 	const lowDimming = extinctionAtAltitude(magnitudes, LOW_ALTITUDE_REFERENCE).toFixed(1);
+
+	let text;
 	switch (level) {
 		case 'pristine':
-			return 'Exceptionally transparent air tonight — faint objects should show well.';
-		case 'none':
-			return null;
+			text = 'Exceptionally clear air — faint objects should show well.';
+			break;
 		case 'slight':
-			return `A little ${noun} in the air, costing roughly ${dimming} magnitudes overhead — barely noticeable.`;
+			text = `A little ${noun.toLowerCase()} — about ${dimming} mag overhead, barely noticeable.`;
+			break;
 		case 'moderate':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead and about ${lowDimming} low in the sky, so fainter objects will be harder to pick out near the horizon.`;
+			text = `${noun} costs ${dimming} mag overhead, ${lowDimming} low down — faint objects suffer near the horizon.`;
+			break;
 		case 'significant':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead but about ${lowDimming} at ${LOW_ALTITUDE_REFERENCE}° up — targets high overhead are still worth it, while anything low will be washed out or invisible.`;
+			text = `${noun} costs ${dimming} mag overhead, ${lowDimming} at ${LOW_ALTITUDE_REFERENCE}° — high targets fine, low ones washed out.`;
+			break;
 		case 'heavy':
-			return `${aerosolLabel(level, type)} is costing roughly ${dimming} magnitudes overhead and about ${lowDimming} low in the sky, washing out all but the brightest objects.`;
+			text = `${noun} costs ${dimming} mag overhead, ${lowDimming} low down — only the brightest show.`;
+			break;
 		default:
 			return null;
 	}
+	return fitCopy(text, COPY_LIMITS.notice, 'transparencyImpact');
 }
 
 // Standard US AQI breakpoints.
@@ -354,21 +407,25 @@ function usAqiCategory(aqi) {
 // Health advice framed for the actual activity: standing outside for a couple
 // of hours. Deliberately silent below AQI 100 so it does not cry wolf.
 function buildHealthAdvisory(category, aqi) {
+	let text;
 	switch (category) {
-		case 'good':
-		case 'moderate':
-			return null;
 		case 'sensitive':
-			return `Air quality is unhealthy for sensitive groups (AQI ${aqi}) — go easy if smoke bothers you.`;
+			text = `AQI ${aqi} — unhealthy for sensitive groups; go easy if smoke bothers you.`;
+			break;
 		case 'unhealthy':
-			return `Air quality is unhealthy (AQI ${aqi}) — keep the session short or wear a mask.`;
+			text = `AQI ${aqi} — unhealthy air; keep the session short or wear a mask.`;
+			break;
 		case 'very-unhealthy':
-			return `Air quality is very unhealthy (AQI ${aqi}) — better to sit this one out.`;
+			text = `AQI ${aqi} — very unhealthy air; better to sit this one out.`;
+			break;
 		case 'hazardous':
-			return `Air quality is hazardous (AQI ${aqi}) — stay inside tonight.`;
+			text = `AQI ${aqi} — hazardous air; stay inside tonight.`;
+			break;
 		default:
+			// Includes 'good' and 'moderate': silent below AQI 100.
 			return null;
 	}
+	return fitCopy(text, COPY_LIMITS.notice, 'healthAdvisory');
 }
 
 // Minimal JSON GET with a timeout. Kept separate from getWeatherConditions so
@@ -792,13 +849,17 @@ function buildAerosolClause(air, quality) {
 	// Rain already told the user not to bother.
 	if (quality === 'unsuitable') return null;
 
+	// The aerosol is named by `airQuality.label` and by the notice icon, so the
+	// clause only has to say what it does to the view -- repeating "heavy smoke
+	// haze" here is what made the old verdict run to three lines.
+	const noun = aerosolNoun(air.aerosolType);
 	switch (air.level) {
 		case 'heavy':
-			return `${air.label} is washing the sky out — worth saving for a clearer night.`;
+			return `${noun} is washing the sky out.`;
 		case 'significant':
-			return `${air.label} is washing out anything low in the sky — stick to targets high overhead.`;
+			return `${noun} will wash out anything low.`;
 		case 'moderate':
-			return `${air.label} is taking the edge off, especially low in the sky.`;
+			return `${noun} is taking the edge off.`;
 		default:
 			return null;
 	}
@@ -814,7 +875,8 @@ function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 	// stargazing" ends up sitting next to "heavy smoke haze", which reads badly
 	// even though both halves are true.
 	if (air && air.level === 'heavy' && quality === 'poor') {
-		return `${air.label} tonight — the sky may be clear, but it is washed out. Worth waiting for cleaner air.`;
+		return fitCopy(`${air.label} — the sky is washed out. Wait for cleaner air.`,
+			COPY_LIMITS.verdict, 'verdict');
 	}
 	// Smoke-led, and specific about WHERE to look: the usable part of the sky is
 	// overhead. Note this fires on 'partial' too, which significant smoke now
@@ -822,7 +884,8 @@ function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 	// windows on what may be a cloudless night.
 	if (air && air.level === 'significant'
 		&& (quality === 'excellent' || quality === 'good' || quality === 'partial')) {
-		return `Clear skies, but ${air.label.toLowerCase()} is washing out anything low — stick to targets high overhead and expect the horizon to be a write-off.`;
+		return fitCopy(`Clear, but ${air.label.toLowerCase()} — favour targets high overhead.`,
+			COPY_LIMITS.verdict, 'verdict');
 	}
 
 	let headline;
@@ -835,26 +898,27 @@ function buildVerdict(quality, hasRain, bestWindow, viewingLevel, air = null) {
 			break;
 		case 'partial':
 			headline = bestWindow
-				? `Your clear window is ${bestWindow.startTime}–${bestWindow.endTime}; mostly cloudy otherwise.`
-				: 'A short clear window tonight, then mostly cloudy.';
+				? `Clear ${bestWindow.startTime}–${bestWindow.endTime}, cloudy otherwise.`
+				: 'A short clear window, then cloudy.';
 			break;
 		case 'unsuitable':
 			if (hasRain) {
 				headline = usesTelescope
-					? 'Rain expected — not a night for the telescope.'
-					: 'Rain expected — not a night for stargazing.';
+					? 'Rain tonight — no telescope weather.'
+					: 'Rain tonight — skip stargazing.';
 			} else {
 				headline = usesTelescope
-					? 'Clouded out — not worth setting up tonight.'
-					: 'Clouded out — not worth heading out tonight.';
+					? 'Clouded out — not worth setting up.'
+					: 'Clouded out — not worth heading out.';
 			}
 			break;
 		default:
-			headline = 'Mostly cloudy tonight — not ideal for stargazing.';
+			headline = 'Mostly cloudy — not great for stargazing.';
 	}
 
 	const aerosolClause = air ? buildAerosolClause(air, quality) : null;
-	return aerosolClause ? `${headline} ${aerosolClause}` : headline;
+	const verdict = aerosolClause ? `${headline} ${aerosolClause}` : headline;
+	return fitCopy(verdict, COPY_LIMITS.verdict, 'verdict');
 }
 
 // ---------------------------------------------------------------------------
@@ -937,24 +1001,27 @@ function buildIcon(quality, air) {
 function buildHeading(quality) {
 	const known = QUALITY_SEVERITIES[quality] !== undefined;
 	const word = known ? quality : 'unknown';
-	return `${word.charAt(0).toUpperCase()}${word.slice(1)} Conditions`;
+	return fitCopy(`${word.charAt(0).toUpperCase()}${word.slice(1)} Conditions`,
+		COPY_LIMITS.heading, 'heading');
 }
 
 // Heading for the targets list. On a smoke-limited night it is altitude, not
 // timing, that constrains you, so the clear-window wording would mislead.
 function buildTargetsHeading(quality, worthObserving, air) {
 	// Rain outranks smoke here too -- see buildIcon.
+	let heading;
 	if (quality !== 'unsuitable' && air && air.dominatesView) {
-		return worthObserving
-			? 'What to Look For High Overhead'
-			: 'Best Positioned Objects (Despite the Smoke)';
+		heading = worthObserving
+			? 'Best Targets High Overhead'
+			: 'Best Targets Despite the Smoke';
+	} else if (quality === 'partial') {
+		heading = 'Best Targets in Clear Windows';
+	} else {
+		heading = worthObserving
+			? 'Best Targets Tonight'
+			: 'Best Targets Despite Conditions';
 	}
-	if (quality === 'partial') {
-		return 'What to Look For During Clear Windows';
-	}
-	return worthObserving
-		? 'What to Look For Tonight'
-		: 'Best Positioned Objects (Despite Conditions)';
+	return fitCopy(heading, COPY_LIMITS.heading, 'targetsHeading');
 }
 
 // A generic, ordered list of advisories. This is the field that buys the most
@@ -998,7 +1065,6 @@ function buildNotices(air, quality) {
 // One-line summary of how much of the night is actually clear.
 function buildClearSummary(clearHours, nightHours, clearFraction) {
 	if (!nightHours || nightHours <= 0) return null;
-	if (clearHours <= 0) return 'No clear skies expected during your window tonight.';
 
 	const clear = Math.round(clearHours);
 	const night = Math.round(nightHours);
@@ -1006,10 +1072,19 @@ function buildClearSummary(clearHours, nightHours, clearFraction) {
 		? clearHours / nightHours
 		: clearFraction;
 
-	if (fraction >= 0.95) return 'Clear skies the entire night.';
-	if (fraction >= 0.75) return `Clear for most of the night — about ${clear} of ${night} hours.`;
-	if (fraction >= 0.45) return `Clear for roughly half the night — about ${clear} of ${night} hours.`;
-	return `About ${clear} of the ${night}-hour window looks clear.`;
+	let text;
+	if (clearHours <= 0) {
+		text = 'No clear skies expected tonight.';
+	} else if (fraction >= 0.95) {
+		text = 'Clear all night.';
+	} else if (fraction >= 0.75) {
+		text = `Clear most of the night (~${clear} of ${night}h).`;
+	} else if (fraction >= 0.45) {
+		text = `Clear about half the night (~${clear} of ${night}h).`;
+	} else {
+		text = `Only ~${clear} of ${night}h look clear.`;
+	}
+	return fitCopy(text, COPY_LIMITS.summary, 'summary');
 }
 
 // Get weather conditions from 7timer
@@ -1093,7 +1168,7 @@ function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0)
 	if (magnitude !== null && magnitude > faintLimit) {
 		// Distinguish "your gear cannot" from "tonight's air cannot".
 		if (extinction > 0 && magnitude <= viewingCaps.maxMagnitude) {
-			return { rating: 'too-faint', reason: 'Too faint through tonight\'s haze' };
+			return { rating: 'too-faint', reason: 'Too faint through the haze' };
 		}
 		return { rating: 'too-faint', reason: `Too faint for ${viewingLevel === 'naked-eye' ? 'naked eye' : 'your telescope'}` };
 	}
@@ -1103,12 +1178,12 @@ function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0)
 
 	if (altitude > 45) {
 		rating = 'excellent';
-		reason = 'High in sky, minimal atmospheric interference';
+		reason = 'High in the sky, steady air';
 	} else if (altitude > 30) {
 		rating = 'good';
 		reason = 'Good viewing angle';
 	} else {
-		reason = 'Viewable but lower in sky';
+		reason = 'Visible but low in the sky';
 	}
 
 	if (magnitude !== null) {
@@ -1116,7 +1191,7 @@ function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0)
 			reason += ', very bright';
 		} else if (magnitude > 5) {
 			rating = rating === 'excellent' ? 'good' : 'fair';
-			reason += ', relatively faint';
+			reason += ', faint';
 		}
 	}
 
@@ -1126,13 +1201,13 @@ function getViewingRating(body, viewingCaps, viewingLevel, magnitudePenalty = 0)
 	// suffered at this altitude.
 	if (extinction >= 1.5) {
 		rating = 'poor';
-		reason += ', badly dimmed by haze low in the sky';
+		reason += ', badly dimmed by haze';
 	} else if (extinction >= 0.8) {
 		rating = rating === 'excellent' ? 'good' : 'fair';
 		reason += ', dimmed by haze';
 	}
 
-	return { rating, reason };
+	return { rating, reason: fitCopy(reason, COPY_LIMITS.reason, 'target reason') };
 }
 
 // Make HTTPS request with Basic Auth
@@ -1628,6 +1703,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+	COPY_LIMITS,
+	fitCopy,
+	aerosolLabel,
+	buildVerdict,
+	buildClearSummary,
+	buildTransparencyImpact,
+	buildHealthAdvisory,
 	interpretWeatherConditions,
 	approxUtcOffset,
 	cloudIndexToPct,

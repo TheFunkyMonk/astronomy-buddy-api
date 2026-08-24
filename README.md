@@ -159,8 +159,8 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 			"steady atmosphere",
 			"moderate smoke haze"
 		],
-		"verdict": "A good night for stargazing. Moderate smoke haze is taking the edge off, especially low in the sky.",
-		"summary": "Clear skies the entire night.",
+		"verdict": "A good night for stargazing. Smoke is taking the edge off.",
+		"summary": "Clear all night.",
 		"airQuality": {
 			"aod": 0.34,
 			"aodPeak": 0.36,
@@ -171,15 +171,15 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 			"dust": 1,
 			"usAqi": 152,
 			"healthCategory": "unhealthy",
-			"healthAdvisory": "Air quality is unhealthy (AQI 152) — keep the session short or wear a mask.",
+			"healthAdvisory": "AQI 152 — unhealthy air; keep the session short or wear a mask.",
 			"label": "Moderate smoke haze",
-			"transparencyImpact": "Moderate smoke haze is costing roughly 0.4 magnitudes overhead and about 1.1 low in the sky, so fainter objects will be harder to pick out near the horizon.",
+			"transparencyImpact": "Smoke costs 0.4 mag overhead, 1.1 low down — faint objects suffer near the horizon.",
 			"dimsView": true,
 			"dominatesView": false
 		},
 		"display": {
 			"heading": "Good Conditions",
-			"targetsHeading": "What to Look For Tonight",
+			"targetsHeading": "Best Targets Tonight",
 			"severity": "caution",
 			"severityRank": 2,
 			"icon": "star"
@@ -189,13 +189,13 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 				"kind": "aerosol",
 				"severity": "caution",
 				"icon": "smoke",
-				"text": "Moderate smoke haze is costing roughly 0.4 magnitudes overhead and about 1.1 low in the sky, so fainter objects will be harder to pick out near the horizon."
+				"text": "Smoke costs 0.4 mag overhead, 1.1 low down — faint objects suffer near the horizon."
 			},
 			{
 				"kind": "health",
 				"severity": "warning",
 				"icon": "health",
-				"text": "Air quality is unhealthy (AQI 152) — keep the session short or wear a mask."
+				"text": "AQI 152 — unhealthy air; keep the session short or wear a mask."
 			}
 		]
 	},
@@ -204,7 +204,7 @@ curl "http://localhost:3000/viewing-data?latitude=51.5074&longitude=-0.1278&elev
 			{
 				"name": "Moon",
 				"bestRating": "excellent",
-				"reason": "High in sky, minimal atmospheric interference, very bright",
+				"reason": "High in the sky, steady air, very bright",
 				"magnitude": -11.5,
 				"constellation": "Pisces",
 				"peakAltitude": 45.3,
@@ -317,8 +317,8 @@ Fields:
 - `clearFraction` (number): Fraction of the window that is clear (0-1)
 - `hasRain` (boolean): Whether precipitation is expected
 - `reasons` (array): Human-readable weather factors
-- `verdict` (string): Headline sentence for the night, including any smoke caveat
-- `summary` (string|null): One-liner on how much of the night is clear
+- `verdict` (string): Headline for the night, including any smoke caveat. One sentence, at most 90 characters — see [Copy Length Budgets](#copy-length-budgets)
+- `summary` (string|null): One-liner on how much of the night is clear, at most 48 characters
 - `airQuality` (object|**optional**): Aerosol and air quality reading — see below
 - `display` (object): Presentation directives — heading, severity, icon. See [Presentation Directives](#presentation-directives-weatherdisplay-weathernotices)
 - `notices` (array): Ordered advisories to render generically. Empty array when there is nothing to flag
@@ -394,11 +394,11 @@ So each target is rated against the extinction at *its own* altitude for that
 hour, not a flat zenith figure. Two consequences:
 
 - Faint targets get `bestRating: "too-faint"` with the reason *"Too faint through
-  tonight's haze"* and drop out of the results.
+  the haze"* and drop out of the results.
 - Targets far too bright to ever be "too faint" are still demoted on the
   extinction they actually suffer: `≥ 0.8` mag knocks the rating down one step
-  (*"dimmed by haze"*), `≥ 1.5` mag forces `poor` (*"badly dimmed by haze low in
-  the sky"*). This is what correctly demotes a low Moon or Saturn.
+  (*"dimmed by haze"*), `≥ 1.5` mag forces `poor` (*"badly dimmed by haze"*).
+  This is what correctly demotes a low Moon or Saturn.
 
 `viewingCapabilities.maxMagnitude` is deliberately **not** modified: it
 advertises the equipment, not tonight's air (and consumers decode it as an
@@ -417,7 +417,7 @@ unreachable):**
 - `healthCategory` (string|null): `good`, `moderate`, `sensitive`, `unhealthy`, `very-unhealthy`, `hazardous`
 - `healthAdvisory` (string|null): Advice for standing outside a couple of hours; `null` below AQI 100 so it does not cry wolf
 - `label` (string|null): Short label, e.g. `"Heavy smoke haze"`
-- `transparencyImpact` (string|null): One sentence on what the aerosols cost you optically
+- `transparencyImpact` (string|null): One short sentence on what the aerosols cost you optically, at most 90 characters
 - `dimsView` (boolean): True when aerosols are dense enough to visibly dim the sky
 - `dominatesView` (boolean): True when the AIR, not cloud, is what limits the night. **Prefer this over testing `level` against string literals** — retuning the tiers then needs no client release
 
@@ -469,7 +469,7 @@ vocabulary itself — so no client needs rebuilding.
 "weather": {
   "display": {
     "heading": "Partial Conditions",
-    "targetsHeading": "What to Look For High Overhead",
+    "targetsHeading": "Best Targets High Overhead",
     "severity": "warning",
     "severityRank": 3,
     "icon": "smoke"
@@ -496,12 +496,48 @@ makes it possible to add an advisory (moon washout, wind, dew point) and have it
 appear on every surface with no client work. `kind` is informational only — never
 switch on it.
 
+#### Copy Length Budgets
+
+**Every user-visible string the API emits fits a fixed character budget, so no
+client ever has to truncate.** The constraint comes from the narrowest surface:
+the TRMNL e-ink dashboard has no scroll and no ellipsis, so copy that overruns
+its description column is simply lost off the edge of the panel.
+
+| Field | Budget |
+| --- | --- |
+| `display.heading`, `display.targetsHeading` | 32 |
+| `verdict` | 90 |
+| `summary` | 48 |
+| `notices[].text`, `airQuality.transparencyImpact`, `airQuality.healthAdvisory` | 90 |
+| `targets[].reason` | 64 |
+
+The copy is *authored* to fit — the budgets are not applied by truncating long
+prose. A `fitCopy` guardrail trims at a word boundary and logs a `[Copy]` warning
+if a future phrasing change ever overruns, so an overflowing string cannot ship
+silently. Seeing that warning in the logs is a bug in the copy, not a normal
+event.
+
+**One idea per field.** The fields are non-overlapping by design, so a surface
+that renders all of them never stacks three sentences saying the same thing:
+
+| Field | Says |
+| --- | --- |
+| `verdict` | What kind of night it is |
+| `summary` | How much of the night is clear |
+| `notices[].text` | The supporting detail (magnitudes lost, health advice) |
+| `airQuality.label` | What the aerosol *is* ("Heavy smoke haze") |
+
+This is why `verdict` no longer names the aerosol when a notice is already
+carrying it: the earlier wording repeated *"heavy smoke haze"* in both places and
+ran the TRMNL description to 190 characters, overflowing the panel.
+
 #### Rules for consumers
 
 1. **Never** switch on `quality` or `airQuality.level` for styling. Use
    `display.severity` and `display.icon`.
 2. **Never** construct user-visible text. Use `display.heading`,
-   `display.targetsHeading`, `verdict`, `summary`, and `notices[].text`.
+   `display.targetsHeading`, `verdict`, `summary`, and `notices[].text`. These are
+   length-budgeted (above), so render them verbatim — no client-side truncation.
 3. Use `airQuality.dominatesView` rather than testing `level` against
    `"significant"`/`"heavy"`.
 4. Use `worthObserving` — not severity — for "should I go out?" affordances. A
