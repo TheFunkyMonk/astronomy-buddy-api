@@ -488,7 +488,14 @@ vocabulary itself — so no client needs rebuilding.
 - `severityRank` (number): 0–4, ordered by increasing alarm. Lets a client place an
   unrecognised severity on the scale instead of guessing
 - `icon` (string): Token naming what to *depict* — `sparkles`, `star`,
-  `partly-cloudy`, `cloudy`, `rain`, `smoke`, `dust`
+  `partly-cloudy`, `cloudy`, `rain`, `smoke`, `dust`. The vocabulary is closed;
+  the API only ever re-maps which token a given night gets
+
+> **`rain` means rain, not "unsuitable".** `quality: "unsuitable"` has two causes —
+> precipitation, and a dry sky that is simply overcast end to end — and the icon
+> distinguishes them: `rain` only when `hasRain` is true, `cloudy` otherwise.
+> Do not derive the glyph from `quality` yourself; a client doing that shows a
+> rain cloud on every dry overcast night, contradicting the `verdict` beside it.
 
 **`notices`** is an ordered array of advisories, each `{ kind, severity, icon, text }`.
 **Clients must loop this blindly rather than reading named fields.** That is what

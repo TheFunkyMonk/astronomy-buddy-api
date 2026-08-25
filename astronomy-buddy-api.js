@@ -816,7 +816,7 @@ function interpretWeatherConditions(data, eveningStartHour, eveningEndHour, long
 		targetsHeading: buildTargetsHeading(quality, worthObserving, air),
 		severity,
 		severityRank: severityRank(severity),
-		icon: buildIcon(quality, air)
+		icon: buildIcon(quality, hasRain, air)
 	};
 	result.notices = buildNotices(air, quality);
 
@@ -951,7 +951,10 @@ const QUALITY_ICONS = {
 	good: 'star',
 	partial: 'partly-cloudy',
 	poor: 'cloudy',
-	unsuitable: 'rain'
+	// `unsuitable` covers TWO different nights -- precipitation, and a dry
+	// overcast -- and only one of them is a rain cloud. This entry is the dry
+	// case; buildIcon swaps in 'rain' when there is actually rain forecast.
+	unsuitable: 'cloudy'
 };
 
 const QUALITY_SEVERITIES = {
@@ -991,7 +994,14 @@ function buildSeverity(quality, air) {
 // limiting factor -- a cloud glyph on a cloudless smoky night is just wrong.
 // Rain still outranks smoke, matching buildVerdict: a smoke glyph on a rained-out
 // night is equally wrong.
-function buildIcon(quality, air) {
+//
+// Rain is keyed off `hasRain` rather than off `quality === 'unsuitable'`. Those
+// are NOT the same condition: a night is also unsuitable when it is simply
+// overcast end to end with no precipitation at all, and keying the glyph off
+// quality put a rain cloud on every dry, cloudy night -- contradicting the
+// verdict sitting next to it, which correctly said "Clouded out".
+function buildIcon(quality, hasRain, air) {
+	if (hasRain) return 'rain';
 	if (quality !== 'unsuitable' && air && air.dominatesView) {
 		return air.aerosolType === 'dust' ? 'dust' : 'smoke';
 	}
