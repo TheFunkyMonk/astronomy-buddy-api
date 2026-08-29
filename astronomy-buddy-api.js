@@ -3,6 +3,8 @@ const http = require('http');
 const url = require('url');
 require('dotenv').config();
 
+// hunter2
+
 // Configuration from environment variables
 const config = {
 	appId: process.env.ASTRONOMY_API_APP_ID,
