@@ -15,8 +15,11 @@ servers:
     options:
       memory: 256m
 
+# ssl: false, yet served over HTTPS: kamal-proxy takes a domain's HTTPS
+# settings from the service at its root path, which is the rjlacount-dev repo,
+# and refuses them on a path prefix. Deploy that one first.
 proxy:
-  ssl: true
+  ssl: false
   host: rjlacount.dev
   path_prefix: /astronomy-buddy
   app_port: 3000
