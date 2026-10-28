@@ -822,69 +822,16 @@ function AstronomyView({ latitude, longitude, elevation }) {
 
 ## Deployment
 
-### Production Considerations
+The API runs in Docker, deployed with [Kamal](https://kamal-deploy.org) (`config/deploy.yml`) to the server that hosts BookPocket. Its kamal-proxy serves `https://rjlacount.dev/astronomy-buddy/` and strips that prefix, so the API itself still answers `/viewing-data` and `/health`. The Astronomy API credentials and the container registry password come from a Bitwarden item through `.kamal/secrets`, which holds names only.
 
-1. **Environment Variables**: Set ASTRONOMY_API_APP_ID and ASTRONOMY_API_APP_SECRET on your server
-2. **Process Manager**: Use PM2 or similar to keep the API running
-	```bash
-	npm install -g pm2
-	pm2 start astronomy-buddy-api.js --name astronomy-api
-	pm2 save
-	pm2 startup
-	```
-3. **Reverse Proxy**: Use nginx for HTTPS and rate limiting
-4. **Monitoring**: Use the `/health` endpoint for uptime monitoring
-5. **Rate Limiting**: Implement rate limiting to prevent abuse
-6. **Caching**: Consider caching responses for the same location/time to reduce API calls
-7. **Logging**: Console logs are comprehensive - consider using a log management service
-
-### Docker Deployment
-
-Create a `Dockerfile`:
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --production
-COPY . .
-EXPOSE 3000
-CMD ["node", "astronomy-buddy-api.js"]
-```
-
-Build and run:
 ```bash
-docker build -t astronomy-buddy-api .
-docker run -p 3000:3000 --env-file .env astronomy-buddy-api
+bin/kamal deploy
+bin/kamal app logs -f
 ```
 
-### Example nginx Configuration
+`bin/kamal` asks for the Bitwarden master password before it starts, then runs Kamal. Changes must be committed before a deploy, since Kamal builds from a clean clone of the last commit.
 
-```nginx
-server {
-	listen 80;
-	server_name api.yoursite.com;
-
-	# Rate limiting
-	limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
-	limit_req zone=api_limit burst=20 nodelay;
-
-	location / {
-		proxy_pass http://localhost:3000;
-		proxy_http_version 1.1;
-		proxy_set_header Upgrade $http_upgrade;
-		proxy_set_header Connection 'upgrade';
-		proxy_set_header Host $host;
-		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-		proxy_cache_bypass $http_upgrade;
-	}
-
-	location /health {
-		proxy_pass http://localhost:3000/health;
-		access_log off;
-	}
-}
-```
+Use the `/health` endpoint for uptime monitoring. kamal-proxy checks it too, and only sends traffic to a new version once it answers.
 
 ## APIs Used
 

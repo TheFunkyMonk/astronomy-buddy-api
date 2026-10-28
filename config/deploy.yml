@@ -1,0 +1,51 @@
+# Deployed with Kamal to the same server as BookPocket, behind its
+# kamal-proxy. The apps call https://rjlacount.dev/astronomy-buddy/..., so the
+# proxy routes that prefix here and strips it: the API still sees
+# /viewing-data and /health.
+service: astronomy-buddy-api
+
+image: thefunkymonk/astronomy-buddy-api
+
+servers:
+  web:
+    hosts:
+      - 62.238.60.170
+    # A cap so a leak here can never take memory from BookPocket. It uses
+    # about 45MB.
+    options:
+      memory: 256m
+
+proxy:
+  ssl: true
+  host: rjlacount.dev
+  path_prefix: /astronomy-buddy
+  app_port: 3000
+  healthcheck:
+    path: /health
+
+ssh:
+  user: root
+  keys:
+    - ~/.ssh/id_ed25519_bookpocket
+
+registry:
+  server: ghcr.io
+  username: TheFunkyMonk
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+env:
+  secret:
+    - ASTRONOMY_API_APP_ID
+    - ASTRONOMY_API_APP_SECRET
+
+# Built on the server, as BookPocket is, rather than cross-built for amd64 on
+# an Apple Silicon Mac.
+builder:
+  arch: amd64
+  remote: ssh://root@62.238.60.170
+
+logging:
+  options:
+    max-size: "10m"
+    max-file: "3"

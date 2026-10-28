@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Kamal, but it asks for the Bitwarden master password before anything else.
+# Kamal reads .kamal/secrets only when a step first needs a secret, which for
+# a deploy is after the image build, and a mistyped password there throws the
+# run away. This unlocks up front, allows a few tries, and exports BW_SESSION
+# so Kamal finds the vault already open. Copied from BookPocket's
+# bin/kamal-unlocked; the same file goes in every app on that server.
+#
+# Usage: bin/kamal deploy
+
+ATTEMPTS=${BW_UNLOCK_ATTEMPTS:-3}
+
+# Commands that never read a secret, plus `secrets`, which unlocks for itself.
+WITHOUT_SECRETS=" secrets version help init "
+
+needs_secrets() {
+  [ "$#" -gt 0 ] && [[ "$1" != -* ]] && [[ "$WITHOUT_SECRETS" != *" $1 "* ]]
+}
+
+if needs_secrets "$@"; then
+  if ! command -v bw > /dev/null; then
+    echo "The Bitwarden CLI is not installed. brew install bitwarden-cli" >&2
+    exit 1
+  fi
+
+  if ! bw login --check > /dev/null 2>&1; then
+    echo "Bitwarden is not logged in. Signing in first." >&2
+    bw login
+  fi
+
+  if ! bw unlock --check > /dev/null 2>&1; then
+    attempt=1
+
+    # A wrong password makes `bw unlock --raw` print nothing and still exit
+    # zero, so the session has to be tested for being non-empty.
+    until BW_SESSION=$(bw unlock --raw) && [ -n "$BW_SESSION" ]; do
+      if [ "$attempt" -ge "$ATTEMPTS" ]; then
+        echo "Still locked after $ATTEMPTS attempts. Nothing was run." >&2
+        exit 1
+      fi
+
+      attempt=$((attempt + 1))
+      echo "That password was not accepted. Attempt $attempt of $ATTEMPTS." >&2
+    done
+
+    export BW_SESSION
+  fi
+fi
+
+exec mise exec -- kamal "$@"
